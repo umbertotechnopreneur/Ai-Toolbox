@@ -1,0 +1,44 @@
+# Publish source/configuration only. Local media, runtimes and personal reports stay local.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/README.txt
+!/LICENSE
+!/ATTRIBUTION.md
+!/AGENTS.md
+!/KNOWN-ISSUES.md
+!/*.cmd
+!/*.ps1
+!/scripts/
+!/scripts/**
+!/tests/
+!/tests/**
+!/config/
+/config/*
+!/config/branding.json
+!/config/catalog-prompt.txt
+!/config/downloads.lock.json
+!/config/fonts.lock.json
+!/config/python313._pth
+!/config/toolbox.json
+!/assets/
+/assets/*
+!/assets/branding/
+/assets/branding/*
+!/assets/branding/ASSET-NOTES.txt
+!/assets/branding/vibeware/
+!/assets/branding/vibeware/**
+
+# Generated Python/Windows files, including within allowed source directories.
+**/__pycache__/
+*.py[cod]
+**/desktop.ini
+**/Thumbs.db
+*.part
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# The historical third-party icon has unverified distribution rights.
+/assets/branding/photo-organizer.ico

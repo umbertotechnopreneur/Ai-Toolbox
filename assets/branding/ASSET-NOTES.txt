@@ -1,0 +1,26 @@
+Photo Organizer branding
+========================
+
+Publisher: Umberto Giacobbi
+Website: https://umbertogiacobbi.biz/
+The website link was confirmed in the supplied personal-brand LinkedIn source
+and checked against the public personal site on 5 October 2026.
+
+Published application icon: vibeware/vibeware-icon.ico
+Derived from the approved VibeWare floppy artwork by scripts/Build-VibeWareIcon.ps1.
+Sizes: 16, 24, 32, 48, 64, 128 and 256 pixels.
+SHA-256: 92fc5198fc4e42b71bb4350957fffa07fe948c3f80a1e0d67ed364e5c4f2a01c
+The full approved logo remains in the About dialog. No external asset path is required.
+
+Historical local-only icon: photo-organizer.ico, from Folder-Ico-main/ico/pictures_folder-3.ico.
+It is retained locally, ignored by Git and no longer selected in branding.json.
+
+HISTORICAL ICON LICENSE STATUS: The supplied collection did not expose a license in the checked
+README/LICENSE/COPYING filenames. Rights to public redistribution of this icon
+have NOT been established. Confirm the original asset license or replace it with
+an owned/licensed icon before public distribution. Selection/copying is not a
+claim of ownership or permission to redistribute third-party artwork.
+
+No personal biography, profile pictures, private AI notes, CV documents or QR
+codes are copied into the toolbox. The existing navy/cyan UI treatment is retained.
+VibeWare is the user's requested code-description label, not a software license.

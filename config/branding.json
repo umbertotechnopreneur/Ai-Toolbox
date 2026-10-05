@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "product_name": "Photo Organizer",
+  "publisher_name": "Umberto Giacobbi",
+  "website_url": "https://umbertogiacobbi.biz/",
+  "website_label": "umbertogiacobbi.biz",
+  "code_style": "VibeWare",
+  "icon_path": "assets/branding/vibeware/vibeware-icon.ico",
+  "vibeware_logo_path": "assets/branding/vibeware/vibeware-logo.png",
+  "manifesto_url": "https://umbertogiacobbi.biz/vibeware",
+  "manifesto_label": "Manifesto VibeWare (URL previsto)"
+}

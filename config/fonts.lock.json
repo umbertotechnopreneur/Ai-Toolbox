@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "family": "JetBrainsMono Nerd Font Mono",
+  "revision": "fa7b859994228a9c8759f99c55a8d31ee92a1b5e",
+  "base_url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/fa7b859994228a9c8759f99c55a8d31ee92a1b5e/",
+  "files": [
+    { "name": "JetBrainsMonoNerdFontMono-Regular.ttf", "path": "patched-fonts/JetBrainsMono/Ligatures/Regular/JetBrainsMonoNerdFontMono-Regular.ttf", "git_blob_sha1": "f6934742bfa1737c3fab7c0371b58453db39d82b", "size_bytes": 2470116 },
+    { "name": "JetBrainsMonoNerdFontMono-Bold.ttf", "path": "patched-fonts/JetBrainsMono/Ligatures/Bold/JetBrainsMonoNerdFontMono-Bold.ttf", "git_blob_sha1": "a03c26bc155b31e480d4c75b3dfb4c013125d6f3", "size_bytes": 2473884 },
+    { "name": "JetBrainsMonoNerdFontMono-Italic.ttf", "path": "patched-fonts/JetBrainsMono/Ligatures/Italic/JetBrainsMonoNerdFontMono-Italic.ttf", "git_blob_sha1": "a715148c5de36adea3ecae0eb2cf09e8b1ef2fdd", "size_bytes": 2472232 },
+    { "name": "JetBrainsMonoNerdFontMono-BoldItalic.ttf", "path": "patched-fonts/JetBrainsMono/Ligatures/BoldItalic/JetBrainsMonoNerdFontMono-BoldItalic.ttf", "git_blob_sha1": "2b3c9ebf778c22e66d1f081c0913c8f965abaa10", "size_bytes": 2475144 },
+    { "name": "OFL.txt", "path": "patched-fonts/JetBrainsMono/Ligatures/Regular/OFL.txt", "git_blob_sha1": "8bee4148c1d54dbf5dae6d6c117fc80414266abb", "size_bytes": 4399 },
+    { "name": "Nerd-Fonts-LICENSE.txt", "path": "LICENSE", "git_blob_sha1": "d163912b383cac468b3052e60ad4998e80046cc7", "size_bytes": 6200 }
+  ]
+}

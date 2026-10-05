@@ -1,0 +1,30 @@
+{
+    "schema_version":  1,
+    "host":  "127.0.0.1",
+    "port":  8091,
+    "model_alias":  "qwen3-vl-4b-local",
+    "context_tokens":  4096,
+    "max_image_edge":  896,
+    "max_output_tokens":  320,
+    "request_timeout_seconds":  180,
+    "startup_timeout_seconds":  120,
+    "default_manifest":  "input/local-files.jsonl",
+    "model_path":  "models/Qwen3-VL-4B/Qwen3VL-4B-Instruct-Q4_K_M.gguf",
+    "projector_path":  "models/Qwen3-VL-4B/mmproj-Qwen3VL-4B-Instruct-F16.gguf",
+    "engine_directory":  "runtime/llama-b11146-cuda12.4",
+    "backends":  {
+                     "cuda":  {
+                                  "engine_directory":  "runtime/llama-b11146-cuda12.4",
+                                  "gpu_layers":  999
+                              },
+                     "vulkan":  {
+                                    "engine_directory":  "runtime/llama-b11146-vulkan",
+                                    "gpu_layers":  999
+                                },
+                     "cpu":  {
+                                 "engine_directory":  "runtime/llama-b11146-cpu",
+                                 "gpu_layers":  0
+                             }
+                 },
+    "engine_backend":  "auto"
+}
