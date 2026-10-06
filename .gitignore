@@ -22,6 +22,8 @@
 !/config/fonts.lock.json
 !/config/python313._pth
 !/config/toolbox.json
+!/config/transcription.json
+!/config/video-description.json
 !/assets/
 /assets/*
 !/assets/branding/
@@ -42,3 +44,5 @@
 
 # The historical third-party icon has unverified distribution rights.
 /assets/branding/photo-organizer.ico
+/assets/branding/local-app.ico
+/config/path-history.json*

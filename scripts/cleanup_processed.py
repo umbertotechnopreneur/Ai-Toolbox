@@ -217,7 +217,8 @@ def refresh_index(target, connection, callback, pause):
             connection.execute("DELETE FROM files WHERE relative=?", (row[0],))
             connection.execute("DELETE FROM origins WHERE relative=?", (row[0],))
     connection.commit()
-    return {"indexed": connection.execute("SELECT COUNT(*) FROM files").fetchone()[0], "cached_target_hashes": cached,
+    return {"indexed": connection.execute("SELECT COUNT(*) FROM files").fetchone()[0], "cached_target_hashes": 0,
+            "indexed_hash_hints": cached,
             "index_errors": errors, "target_omissions": omissions}
 
 
@@ -258,23 +259,47 @@ def hash_stream(path, stream, pause, callback):
     return digest.hexdigest(), after
 
 
+# Create one simulation-local cache; no paths or file handles survive the job.
+# Exceptions: all retained read locks are released when the simulation ends.
+@contextmanager
+def target_hash_cache():
+    with ExitStack() as handles:
+        # Persistent metadata is a search hint, not proof of unchanged bytes.
+        # Only Windows handles denying write/delete sharing authorize reuse.
+        yield {"handles": handles, "verified": {}, "opened": 0}
+
+
 # Parameter target: fixed archive root.
 # Parameter connection: SQLite index holding verified hashes, not just JSON claims.
 # Parameter relative: indexed asset to verify.
 # Parameter pause: stop marker.
 # Parameter callback: detailed verification receiver.
 # Parameter stream: optional held target handle that remains locked throughout recycling.
+# Parameter cache: bounded, simulation-local hashes with retained read locks.
 # Exceptions: OSError/ValueError/Paused on unavailable or changing assets.
-def target_hash(target, connection, relative, pause, callback, stream=None):
+def target_hash(target, connection, relative, pause, callback, stream=None, cache=None):
     path = scoped_file(target, relative)
     signature = fingerprint(path)
     row = connection.execute("SELECT * FROM files WHERE relative=?", (relative,)).fetchone()
-    if row and row["sha256"] and signature["strong"] and json.loads(row["signature"]) == signature:
-        callback({"event": "log", "action": "target_hash_cache_hit", "target_relative": relative, "sha256": row["sha256"]})
-        return row["sha256"], signature
-    digest, signature = hash_stream(path, stream, pause, callback) if stream else hash_file(path, pause, callback)
     if not row:
         raise ValueError("File non presente nell'indice del target")
+    cached = cache["verified"].get(relative) if cache is not None and stream is None else None
+    if cached and cached["signature"] == signature:
+        callback({"event": "log", "action": "target_hash_cache_hit", "target_relative": relative,
+                  "sha256": cached["sha256"], "scope": "locked_simulation"})
+        return cached["sha256"], signature
+    retain = (stream is None and cache is not None and os.name == "nt"
+              and signature["strong"] and cache["opened"] < 64)
+    if stream is not None:
+        # Destructive use always requires fresh bytes, even after a preview.
+        digest, signature = hash_stream(path, stream, pause, callback)
+    elif retain:
+        held = cache["handles"].enter_context(organizer.source_stream(path, True))
+        cache["opened"] += 1
+        digest, signature = hash_stream(path, held, pause, callback)
+        cache["verified"][relative] = {"sha256": digest, "signature": signature}
+    else:
+        digest, signature = hash_file(path, pause, callback)
     connection.execute("UPDATE files SET sha256=?,signature=?,size=? WHERE relative=?",
                        (digest, json.dumps(signature, sort_keys=True), signature["size"], relative))
     connection.commit()
@@ -288,8 +313,9 @@ def target_hash(target, connection, relative, pause, callback, stream=None):
 # Parameter control: index/control folder holding previews and the pause marker.
 # Parameter limit: bounded maximum number of files authorized by one preview.
 # Parameter callback: progress/candidate/log receiver.
+# Parameter cache: optional simulation-local locked copies, never persisted proof.
 # Exceptions: per-file errors preserve that input; global path/state errors abort.
-def make_plan(source, target, connection, control, limit, callback):
+def make_plan(source, target, connection, control, limit, callback, cache=None):
     pause = control / "pause.request"
     files, omissions = scan_files(source, callback, pause)
     candidates, kept, checked = [], [], 0
@@ -319,7 +345,7 @@ def make_plan(source, target, connection, control, limit, callback):
                 if copy.stat().st_size != signature["size"] or os.path.samefile(current, copy):
                     continue
                 try:
-                    saved_hash, copy_signature = target_hash(target, connection, target_relative, pause, callback)
+                    saved_hash, copy_signature = target_hash(target, connection, target_relative, pause, callback, cache=cache)
                     if digest == saved_hash:
                         match = {"source_relative": relative, "target_relative": target_relative,
                                  "sha256": digest, "source_signature": signature, "target_signature": copy_signature,
@@ -534,7 +560,8 @@ def run_cleanup(source, target, mode="plan", limit=50, plan_id=None, confirmatio
                         callback({"event": "progress", "phase": "indice SHA-256", "done": done, "total": len(rows), "filename": row[0]})
                     summary = {"mode": "cleanup-index", "total": stats["indexed"], "errors": stats["index_errors"], "deleted": 0, **stats}
                 else:
-                    summary = {**make_plan(source, target, connection, control, limit, callback), **stats}
+                    with target_hash_cache() as cache:
+                        summary = {**make_plan(source, target, connection, control, limit, callback, cache=cache), **stats}
         except organizer.Paused:
             summary = {"mode": "cleanup-" + mode, "stopped": True, "ready_for_review": False, "deleted": 0, "errors": 0}
         callback({"event": "summary", "summary": summary})

@@ -1,0 +1,7 @@
+{
+  "min_frames": 4,
+  "max_frames": 24,
+  "seconds_per_frame": 30,
+  "max_image_edge": 896,
+  "ffmpeg_timeout_seconds": 60
+}

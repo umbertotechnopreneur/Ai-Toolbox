@@ -245,7 +245,7 @@ class FolderOrganizerTests(unittest.TestCase):
     def test_interrupted_duplicate_provenance_write_recovers_owned_sidecar(self):
         (self.source / "a.txt").write_bytes(b"duplicate")
         (self.source / "b.txt").write_bytes(b"duplicate")
-        writer = ai.write_json
+        writer = organizer.write_sidecar
         calls = 0
 
         # Parameter path: generated artifact path, never a source file.
@@ -259,7 +259,7 @@ class FolderOrganizerTests(unittest.TestCase):
                     raise OSError("Simulated interruption before atomic sidecar write")
             writer(path, value)
 
-        with patch.object(ai, "write_json", side_effect=interrupt_second_sidecar):
+        with patch.object(organizer, "write_sidecar", side_effect=interrupt_second_sidecar):
             partial = self.run_copy()
         self.assertFalse(partial["ready_for_review"])
         with patch.object(organizer, "stage_file", side_effect=AssertionError("Completed source reread")):

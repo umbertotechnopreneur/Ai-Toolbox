@@ -111,12 +111,46 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(original.read_bytes(), b"AAAA")
 
     # Parameter self: active regression case.
-    def test_target_hash_is_reused_only_for_unchanged_fingerprint(self):
+    def test_persisted_hash_is_rechecked_even_for_unchanged_fingerprint(self):
         self.pair()
         self.plan(); self.events.clear()
         self.assertEqual(self.plan()["matched"], 1)
-        self.assertTrue(any(event.get("action") == "target_hash_cache_hit" for event in self.events))
-        self.assertFalse(any(event.get("action") == "target_hash_verified" for event in self.events))
+        self.assertFalse(any(event.get("action") == "target_hash_cache_hit" for event in self.events))
+        self.assertTrue(any(event.get("action") == "target_hash_verified" for event in self.events))
+
+    # Parameter self: active regression case; only synthetic files are changed.
+    def test_identical_fingerprint_cannot_hide_changed_target_in_preview_or_apply(self):
+        for mode in ("preview", "apply"):
+            with self.subTest(mode=mode):
+                original, copy = self.pair(name=mode + ".txt")
+                plan = self.plan()
+                frozen = cleanup.fingerprint(copy)
+                actual = cleanup.fingerprint
+                copy.write_bytes(b"BBBB")
+
+                # Parameter path: report the old signature for this one changed copy.
+                def colliding_fingerprint(path):
+                    return frozen if path == copy else actual(path)
+
+                self.events.clear()
+                with patch.object(cleanup, "fingerprint", side_effect=colliding_fingerprint):
+                    result = self.plan() if mode == "preview" else self.apply(plan)
+                self.assertEqual(result["matched"] if mode == "preview" else result["deleted"], 0)
+                self.assertEqual(original.read_bytes(), b"AAAA")
+                self.assertEqual(self.recycler.calls, [])
+                self.assertTrue(any(event.get("action") == "target_hash_verified" for event in self.events))
+
+    # Parameter self: active regression case; the lock is never held on real media.
+    def test_same_simulation_reuses_only_write_locked_target(self):
+        if os.name != "nt":
+            self.skipTest("Windows share modes authorize in-run hash reuse")
+        original, copy = self.pair()
+        (self.source / "duplicate.txt").write_bytes(original.read_bytes())
+        self.assertEqual(self.plan()["matched"], 2)
+        self.assertTrue(any(event.get("action") == "target_hash_cache_hit"
+                            and event.get("scope") == "locked_simulation" for event in self.events))
+        # End of preview releases its retained handle.
+        copy.write_bytes(b"BBBB")
 
     # Parameter self: active regression case.
     def test_changed_target_with_restored_size_mtime_invalidates_cache(self):

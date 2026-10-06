@@ -8,4 +8,5 @@
 - Keep detailed logs independent of selected media directories.
 - Missing requested fonts must fall back to an available Windows monospace family.
 - Preserve unrelated local files and running jobs. Avoid package builds or app restarts while a user job is running.
-- Run Python regression tests with the embedded interpreter after setup; validate PowerShell syntax for changed scripts.
+- Do not run tests or validation checks, or create branches or worktrees, unless Umberto explicitly requests the specific action. If any of these actions are needed, ask for authorization before proceeding.
+- Work on the current branch by default. When tests are authorized, use the embedded interpreter for Python regression tests; validate PowerShell syntax only when validation is authorized.

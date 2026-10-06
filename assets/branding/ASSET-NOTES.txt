@@ -15,6 +15,12 @@ The full approved logo remains in the About dialog. No external asset path is re
 Historical local-only icon: photo-organizer.ico, from Folder-Ico-main/ico/pictures_folder-3.ico.
 It is retained locally, ignored by Git and no longer selected in branding.json.
 
+Selected local application icon (6 October 2026): local-app.ico,
+copied from Folder-Ico-main/ico/pictures_folder-3.ico (blue photo folder).
+Initialize-AppBranding prefers this optional local file when present; otherwise
+the published VibeWare icon from branding.json remains the portable fallback.
+local-app.ico is excluded from Git pending confirmed redistribution rights.
+
 HISTORICAL ICON LICENSE STATUS: The supplied collection did not expose a license in the checked
 README/LICENSE/COPYING filenames. Rights to public redistribution of this icon
 have NOT been established. Confirm the original asset license or replace it with

@@ -8,6 +8,9 @@ function Initialize-AppBranding {
     if (-not $manifesto.IsAbsoluteUri -or $manifesto.Scheme -ne 'https' -or $manifesto.UserInfo) { throw 'Invalid VibeWare manifesto URL.' }
     $iconPath = [IO.Path]::GetFullPath((Join-Path $script:appRoot $script:branding.icon_path))
     if (-not $iconPath.StartsWith($script:appRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Brand icon must stay in the toolbox.' }
+    # Optional local-only artwork stays out of the public source distribution.
+    $localIconPath = Join-Path $script:appRoot 'assets\branding\local-app.ico'
+    if ([IO.File]::Exists($localIconPath)) { $iconPath = $localIconPath }
     $vibeWareLogoPath = [IO.Path]::GetFullPath((Join-Path $script:appRoot $script:branding.vibeware_logo_path))
     if (-not $vibeWareLogoPath.StartsWith($script:appRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'VibeWare logo must stay in the toolbox.' }
     $script:brandIcon = $null
@@ -51,14 +54,15 @@ function New-PublisherCredit {
     return $credit
 }
 
-# Returns the approved VibeWare logo at a fixed presentation size.
+# Size: square presentation size for the approved logo; About retains its default size.
 # Exceptions: Missing artwork leaves the About dialog functional without a logo.
 function New-VibeWareLogo {
+    param([int]$Size = 152)
     if ($null -eq $script:vibeWareLogo) { return $null }
     $logo = New-Object Windows.Forms.PictureBox
     $logo.Image = $script:vibeWareLogo
     $logo.SizeMode = 'Zoom'
-    $logo.Size = New-Object Drawing.Size(152, 152)
+    $logo.Size = New-Object Drawing.Size($Size, $Size)
     $logo.Dock = 'None'
     $logo.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 12)
     $logo.AccessibleName = 'Logo VibeWare: floppy pixel art con monogramma VW'

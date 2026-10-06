@@ -20,6 +20,8 @@ from typing import Any, Callable
 import ai_toolbox as ai
 import analyze_local as analyzer
 import photo_organizer as technical
+import transcription as speech
+import video_description as video_ai
 from job_log import JobLog
 
 VERSION = 1
@@ -36,6 +38,15 @@ KNOWN_FOLDERS = {"photo": "Foto", "snapshot": "Snapshot", "screenshot": "Snapsho
 
 class Paused(Exception):
     """A cooperative pause leaves source files and completed work intact."""
+
+
+class SidecarRecoveryRequired(ValueError):
+    # Parameter self: recoverable interruption, distinct from an altered valid JSON.
+    # Parameter candidates: verified assets with missing or unreadable JSON sidecars.
+    def __init__(self, candidates: list[dict[str, Any]]):
+        super().__init__("Sidecar danneggiati: recupero disponibile su conferma")
+        self.candidates = candidates
+        self.confirmation_hash = hashlib.sha256(json.dumps(candidates, sort_keys=True).encode()).hexdigest()
 
 
 # Parameter event: structured message consumed by the GUI and CLI progress view.
@@ -390,6 +401,18 @@ def owned_sidecar(destination: Path, output: Path) -> Path:
     return sidecar
 
 
+# Parameter path: an owned sidecar path already checked by owned_sidecar.
+# Parameter value: checkpoint metadata to persist before recording the JSON checksum.
+# Exceptions: filesystem errors leave the previous sidecar intact until atomic replacement.
+def write_sidecar(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(path.name + "." + str(time.time_ns()) + ".tmp")
+    with temporary.open("x", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())  # Flush JSON bytes before exposing the new sidecar.
+    temporary.replace(path)
+
+
 # Parameter connection: persistent workspace checkpoint store.
 # Parameter destination: canonical review output.
 # Parameter asset: one known content asset to verify before declaring it reusable.
@@ -408,14 +431,21 @@ def verify_asset(connection: sqlite3.Connection, destination: Path, asset: sqlit
     if not sidecar.exists():
         if not repair_sidecar:
             return False
-        ai.write_json(sidecar, expected)
+        write_sidecar(sidecar, expected)
     else:
-        saved = json.loads(sidecar.read_text(encoding="utf-8"))
+        raw = sidecar.read_bytes()
+        try:
+            saved = json.loads(raw.decode("utf-8-sig"))
+        except (ValueError, UnicodeError):
+            raise SidecarRecoveryRequired([{"asset_key": asset["asset_key"],
+                                           "sidecar": str(sidecar.relative_to(destination)),
+                                           "damaged_hash": hashlib.sha256(raw).hexdigest(),
+                                           "sha256": asset["sha256"]}])
         if saved != expected:
             # A committed provenance update may have been interrupted before its atomic JSON write.
             previous_owned_bytes = asset["sidecar_hash"] and file_hash(sidecar) == asset["sidecar_hash"]
             if asset["sidecar_pending"] and previous_owned_bytes and repair_sidecar:
-                ai.write_json(sidecar, expected)
+                write_sidecar(sidecar, expected)
             else:
                 raise ValueError("Sidecar modificato o incompleto: preservato senza sovrascriverlo: " + str(sidecar))
     connection.execute("UPDATE assets SET sidecar_hash=?,sidecar_pending=0 WHERE asset_key=?",
@@ -456,7 +486,7 @@ def commit_occurrence(connection: sqlite3.Connection, destination: Path, item: d
     connection.execute("UPDATE assets SET sidecar_pending=1 WHERE asset_key=?", (asset_key,))
     connection.commit()
     asset = connection.execute("SELECT * FROM assets WHERE asset_key=?", (asset_key,)).fetchone()
-    ai.write_json(sidecar, sidecar_payload(connection, asset, destination))
+    write_sidecar(sidecar, sidecar_payload(connection, asset, destination))
     connection.execute("UPDATE assets SET sidecar_hash=?,sidecar_pending=0 WHERE asset_key=?", (file_hash(sidecar), asset_key))
     connection.commit()
 
@@ -514,10 +544,17 @@ def enrich_ai(record: dict[str, Any], stage: Path, settings: dict[str, Any] | No
 # Parameter verify_only: rechecks existing output/sidecars without reading originals or starting AI.
 # Parameter reserve_bytes: per-volume minimum free-space margin.
 # Parameter callback: JSON progress/event sink used by console and GUI.
+# Parameter transcribe: optional offline recognition of verified audio/video output.
+# Parameter describe_videos: independent opt-in for sampled video descriptions.
+# Parameter video_min_frames: optional minimum sample count override.
+# Parameter video_max_frames: optional maximum sample count override.
+# Parameter video_seconds_per_frame: optional duration-per-sample override.
 # Exceptions: path/state errors abort; per-file copy errors are recorded and prevent readiness.
 def run_folder(source: Path, destination: Path, run: bool = False, allow_cloud: bool = False,
                use_ai: bool = True, verify_only: bool = False, reserve_bytes: int = 20 * 1024**3,
-               callback: Callable = emit) -> dict[str, Any]:
+               callback: Callable = emit, transcribe: bool = False, describe_videos: bool = False,
+               video_min_frames: int | None = None, video_max_frames: int | None = None,
+               video_seconds_per_frame: float | None = None) -> dict[str, Any]:
     source, destination = validate_paths(source, destination)
     items, omissions = scan_source(source, callback)
     total_bytes = sum(item["size"] for item in items)
@@ -530,6 +567,14 @@ def run_folder(source: Path, destination: Path, run: bool = False, allow_cloud: 
         return summary
     if verify_only and not (destination / CONTROL / "state.sqlite3").is_file():
         raise ValueError("Nessuno stato da verificare in questa destinazione")
+    if transcribe and verify_only:
+        raise ValueError("La verifica non genera trascrizioni")
+    if describe_videos and verify_only:
+        raise ValueError("La verifica non genera descrizioni video")
+    video_config = video_ai.configuration(video_min_frames, video_max_frames, video_seconds_per_frame) if describe_videos else None
+    video_settings = ai.configuration() if describe_videos else None
+    if transcribe and not (ai.ROOT / "runtime/transcription/installation.json").is_file():
+        raise ValueError("Prepara prima la trascrizione: Opzioni / Setup > Installa trascrizione")
     settings = ai.configuration() if use_ai and not verify_only else None
     prompt = (ai.ROOT / "config/catalog-prompt.txt").read_text(encoding="utf-8") if settings else ""
     identity = ai.cache_fingerprint(settings, prompt) if settings else "no-ai"
@@ -569,6 +614,45 @@ def run_folder(source: Path, destination: Path, run: bool = False, allow_cloud: 
     try:
         with ExitStack() as stack:
             engine = {}
+            speech_session = {}
+            speech_queue = {}
+            video_queue = {}
+            if describe_videos:
+                callback({"event": "log", "message": "Descrizione video attiva: JSON presenti conservati; "
+                          f"{video_config['min_frames']}..{video_config['max_frames']} fotogrammi, "
+                          f"uno ogni {video_config['seconds_per_frame']} s di durata; elaborazione dopo la copia."})
+                existing_videos = missing_video_json = 0
+                for item in items:
+                    if pause.exists():
+                        raise Paused()
+                    saved = connection.execute(
+                        "SELECT assets.* FROM entries JOIN assets USING(asset_key) "
+                        "WHERE entries.relative=? AND entries.size=? AND entries.mtime=?",
+                        (item["relative"], item["size"], item["mtime"])).fetchone()
+                    if saved and Path(saved["output"]).suffix.casefold() in technical.VIDEO_EXTENSIONS:
+                        existing_videos += 1
+                        output = owned_output(destination, saved["output"])
+                        missing_video_json += int(not Path(str(output) + ".video.json").exists())
+                callback({"event": "log", "action": "video_description_inventory",
+                          "message": f"Controllo descrizioni video: {existing_videos} video gia registrati, "
+                                     f"{missing_video_json} JSON assenti. Copie e JSON presenti conservati."})
+            if transcribe:
+                existing_media = missing_subtitles = 0
+                for item in items:
+                    if pause.exists():
+                        raise Paused()
+                    saved = connection.execute(
+                        "SELECT assets.* FROM entries JOIN assets USING(asset_key) "
+                        "WHERE entries.relative=? AND entries.size=? AND entries.mtime=?",
+                        (item["relative"], item["size"], item["mtime"])).fetchone()
+                    if saved and Path(saved["output"]).suffix.casefold() in technical.AUDIO_EXTENSIONS | technical.VIDEO_EXTENSIONS:
+                        existing_media += 1
+                        output = owned_output(destination, saved["output"])
+                        missing_subtitles += int(not Path(str(output) + ".srt").exists())
+                callback({"event": "log", "action": "transcription_inventory",
+                          "message": f"Controllo SRT: {existing_media} media gia registrati, "
+                                     f"{missing_subtitles} SRT assenti (nessun riconoscimento se gia senza audio/voce). "
+                                     "Gli SRT presenti saranno conservati; trascrizione dopo la copia."})
             for item in items:
                 path = source / item["relative"]
                 if pause.exists():
@@ -579,6 +663,10 @@ def run_folder(source: Path, destination: Path, run: bool = False, allow_cloud: 
                         send_progress(callback, progress, "verifica output per ripresa", path.name)
                         asset = connection.execute("SELECT * FROM assets WHERE asset_key=?", (entry["asset_key"],)).fetchone()
                         if asset and (asset["asset_key"] in verified or verify_asset(connection, destination, asset, repair_sidecar=not verify_only)):
+                            if transcribe and json.loads(asset["record"])["extension_normalized"] in technical.AUDIO_EXTENSIONS | technical.VIDEO_EXTENSIONS:
+                                queue_missing_transcription(destination, asset, speech_queue, callback)
+                            if describe_videos:
+                                queue_missing_video_description(destination, asset, video_queue, callback)
                             callback({"event": "log", "action": "resume_verified", "source": str(path),
                                       "output": str(destination / asset["output"]), "sha256": asset["sha256"]})
                             verified.add(asset["asset_key"])
@@ -638,6 +726,11 @@ def run_folder(source: Path, destination: Path, run: bool = False, allow_cloud: 
                               "created_at_utc": technical.iso_from_timestamp(getattr(original_stat, "st_birthtime", original_stat.st_ctime)),
                               "sha256": digest, "copied_or_matched_at_utc": ai.utc_now()}
                     commit_occurrence(connection, destination, item, key, origin)
+                    if transcribe and path.suffix.casefold() in technical.AUDIO_EXTENSIONS | technical.VIDEO_EXTENSIONS:
+                        asset = connection.execute("SELECT * FROM assets WHERE asset_key=?", (key,)).fetchone()
+                        queue_missing_transcription(destination, asset, speech_queue, callback)
+                    if describe_videos:
+                        queue_missing_video_description(destination, asset, video_queue, callback)
                     callback({"event": "log", "action": "copy_verified", "source": str(path),
                               "output": str(destination / asset["output"]), "sha256": digest,
                               "size_bytes": item["size"], "asset_key": key})
@@ -649,12 +742,65 @@ def run_folder(source: Path, destination: Path, run: bool = False, allow_cloud: 
                     send_progress(callback, progress, "copiato e verificato", path.name)
                 except Paused:
                     raise
-                except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+                except SidecarRecoveryRequired:
+                    raise  # Ask explicitly; do not bury corruption among per-file errors.
+                except (OSError, ValueError, RuntimeError, ImportError, sqlite3.Error) as error:
                     summary["errors"] += 1
                     progress["done"] += 1
                     failure = {"relative": item["relative"], "error": str(error)}
                     failures.append(failure)
                     callback({"event": "error", "filename": path.name, "message": str(error)})
+            if transcribe:
+                summary["transcription_queued"] = len(speech_queue)
+                summary["transcription_completed"] = 0
+                for number, (key, relative) in enumerate(speech_queue.items(), 1):
+                    if pause.exists():
+                        raise Paused()
+                    asset = connection.execute("SELECT * FROM assets WHERE asset_key=?", (key,)).fetchone()
+                    filename = Path(asset["output"]).name
+                    send_progress(callback, progress, f"trascrizione {number}/{len(speech_queue)}", filename)
+                    try:
+                        # Recheck the verified copy before generating anything; never recopy it.
+                        if not verify_asset(connection, destination, asset, repair_sidecar=True):
+                            raise ValueError("Media non verificabile prima della trascrizione")
+                        enrich_transcription(connection, destination, asset, pause, speech_session, callback)
+                        summary["transcription_completed"] += 1
+                    except Paused:
+                        raise
+                    except SidecarRecoveryRequired:
+                        raise
+                    except (OSError, ValueError, RuntimeError, ImportError, sqlite3.Error) as error:
+                        summary["errors"] += 1
+                        failures.append({"relative": relative, "error": str(error)})
+                        callback({"event": "error", "filename": filename, "message": str(error)})
+            if describe_videos:
+                summary["video_descriptions_queued"] = len(video_queue)
+                summary["video_descriptions_completed"] = 0
+                for number, key in enumerate(video_queue, 1):
+                    if pause.exists():
+                        raise Paused()
+                    asset = connection.execute("SELECT * FROM assets WHERE asset_key=?", (key,)).fetchone()
+                    filename = Path(asset["output"]).name
+                    send_progress(callback, progress, f"descrizione video {number}/{len(video_queue)}", filename)
+                    try:
+                        if not verify_asset(connection, destination, asset, repair_sidecar=True):
+                            raise ValueError("Video non verificabile prima dell'analisi")
+                        output = owned_output(destination, asset["output"])
+                        cache = control / "video-frames"
+                        if cache.is_symlink() or cache.is_junction() or not cache.resolve().is_relative_to(control.resolve()):
+                            raise ValueError("Cache fotogrammi non sicura")
+                        video_ai.describe(output, asset["sha256"], pause, cache, video_config,
+                                          video_settings, stack, engine, callback)
+                        summary["video_descriptions_completed"] += 1
+                    except speech.TranscriptionPaused:
+                        raise Paused()
+                    except SidecarRecoveryRequired:
+                        raise
+                    except Exception as error:
+                        summary["errors"] += 1
+                        message = f"Descrizione video fallita per {filename}: {type(error).__name__}: {error}"
+                        failures.append({"relative": asset["output"], "error": message})
+                        callback({"event": "error", "filename": filename, "message": message})
     except (Paused, KeyboardInterrupt):
         summary["stopped"] = True
     finally:
@@ -695,6 +841,265 @@ def run_folder(source: Path, destination: Path, run: bool = False, allow_cloud: 
     return summary
 
 
+# Parameter destination: review workspace containing verified videos.
+# Parameter asset: registered media row, without modifying its technical metadata.
+# Parameter queue: unique asset keys awaiting descriptions.
+# Parameter callback: persistent inventory/log receiver.
+# Exceptions: unsafe description files fail without replacement.
+def queue_missing_video_description(destination: Path, asset: sqlite3.Row,
+                                    queue: dict[str, str], callback: Callable) -> None:
+    if Path(asset["output"]).suffix.casefold() not in technical.VIDEO_EXTENSIONS:
+        return
+    output = owned_output(destination, asset["output"])
+    target = Path(str(output) + ".video.json")
+    if target.is_symlink() or target.is_junction() or (target.exists() and not target.is_file()):
+        raise ValueError("Descrizione video non sicura: " + str(target))
+    if target.exists():
+        callback({"event": "log", "message": "JSON video presente, conservato: " + str(target)})
+    else:
+        queue.setdefault(asset["asset_key"], asset["output"])
+
+
+# Parameter destination: current review workspace containing copied media.
+# Parameter asset: registered output; byte verification remains the caller's responsibility.
+# Parameter queue: insertion-ordered unique assets needing subtitle inspection/recognition.
+# Parameter callback: durable status/log receiver.
+# Exceptions: unsafe output paths fail without modifying subtitles.
+def queue_missing_transcription(destination: Path, asset: sqlite3.Row,
+                                queue: dict[str, str], callback: Callable) -> None:
+    output = owned_output(destination, asset["output"])
+    subtitle = Path(str(output) + ".srt")
+    if subtitle.is_symlink() or subtitle.is_junction() or (subtitle.exists() and not subtitle.is_file()):
+        raise ValueError("Artefatto trascrizione non sicuro: " + str(subtitle))
+    if subtitle.exists():
+        callback({"event": "log", "action": "transcription_preserved",
+                  "message": "SRT presente, conservato senza modifiche: " + str(subtitle)})
+        return
+    # Inspect no-audio/no-speech receipts in transcribe(), where identity is checked.
+    # A duplicate original must not enqueue the same output twice.
+    queue.setdefault(asset["asset_key"], asset["output"])
+
+
+# Parameter connection: workspace metadata checkpoint.
+# Parameter destination: output whose originals remain untouched.
+# Parameter asset: verified byte-identical output ready for speech recognition.
+# Parameter pause: cooperative job pause marker.
+# Parameter session: per-job reusable Whisper model.
+# Parameter callback: durable progress/log event receiver.
+# Exceptions: recognition failures preserve copied media; pause retains completed subtitles.
+def enrich_transcription(connection: sqlite3.Connection, destination: Path, asset: sqlite3.Row,
+                         pause: Path, session: dict[str, Any], callback: Callable) -> None:
+    record = json.loads(asset["record"])
+    if record["extension_normalized"] not in technical.AUDIO_EXTENSIONS | technical.VIDEO_EXTENSIONS:
+        return
+    output = owned_output(destination, asset["output"])
+    try:
+        result = speech.transcribe(output, asset["sha256"], pause, session, callback)
+    except speech.TranscriptionPaused:
+        raise Paused()
+    except Exception as error:
+        # Keep a decoder/library failure local to this media. The outer loop
+        # records it, preserves the verified copy and continues other files.
+        raise RuntimeError(f"Trascrizione fallita per {output.name}: {type(error).__name__}: {error}") from error
+    if record.get("transcription") != result:
+        record["transcription"] = result
+        connection.execute("UPDATE assets SET record=?,sidecar_pending=1 WHERE asset_key=?",
+                           (json.dumps(record, ensure_ascii=False), asset["asset_key"]))
+        connection.commit()
+        refreshed = connection.execute("SELECT * FROM assets WHERE asset_key=?", (asset["asset_key"],)).fetchone()
+        if not verify_asset(connection, destination, refreshed, repair_sidecar=True):
+            raise ValueError("Media non verificabile dopo trascrizione")
+
+
+# Parameter source: new root with unchanged relative paths for completed originals.
+# Parameter destination: existing review workspace, never a new output.
+# Parameter use_ai: current AI setting must match the saved processing identity.
+# Parameter allow_cloud: authorizes reading this selected folder through OneDrive.
+# Parameter callback: persistent log and GUI progress receiver.
+# Parameter recovery_hash: explicit approval of the exact damaged-sidecar inventory.
+# Exceptions: mismatches, missing files or changed sidecars abort without adopting the new root.
+def relocate_source(source: Path, destination: Path, use_ai: bool, allow_cloud: bool,
+                    callback: Callable = emit, recovery_hash: str | None = None) -> dict[str, Any]:
+    source, destination = validate_paths(source, destination)
+    control = destination / CONTROL
+    database = control / "state.sqlite3"
+    if not database.is_file():
+        raise ValueError("Nessuno stato esistente da trasferire")
+    settings = ai.configuration() if use_ai else None
+    prompt = (ai.ROOT / "config/catalog-prompt.txt").read_text(encoding="utf-8") if settings else ""
+    identity = ai.cache_fingerprint(settings, prompt) if settings else "no-ai"
+    config_id = hashlib.sha256(json.dumps({"version": VERSION, "ai": identity,
+                                         "layout": "YYYY/MM/YYYY-MM-DD"}, sort_keys=True).encode()).hexdigest()
+    with workspace_lock(destination), closing(sqlite3.connect(database)) as connection:
+        connection.row_factory = sqlite3.Row
+        saved = dict(connection.execute("SELECT key,value FROM settings"))
+        if saved.get("config_id") != config_id:
+            raise ValueError("Impostazioni diverse: ripristina AI/modello/impostazioni originali prima del trasferimento")
+        entries = list(connection.execute("SELECT * FROM entries ORDER BY relative"))
+        assets = {row["asset_key"]: row for row in connection.execute("SELECT * FROM assets")}
+        new_root = os.path.normcase(str(source))
+        pause = control / "pause.request"
+        if pause.exists():
+            pause.unlink()  # Reset only an explicitly restarted job's own pause marker.
+        items, omissions = scan_source(source, callback)
+        if omissions:
+            raise ValueError("Nuova sorgente con percorsi esclusi/inaccessibili: trasferimento annullato")
+        inventory = {item["relative"]: item for item in items}
+        progress = {"done": 0, "total": len(entries), "bytes_done": 0,
+                    "bytes_total": sum(entry["size"] for entry in entries), "started": time.monotonic()}
+        updates = []
+        checked_assets = set()
+        recovery_candidates = []
+        accepted_sidecar_hashes = {}
+        transferred_at = ai.utc_now()
+        try:
+            for entry in entries:
+                if pause.exists():
+                    raise Paused()
+                item = inventory.get(entry["relative"])
+                asset = assets.get(entry["asset_key"])
+                if not item or not asset or item["size"] != entry["size"]:
+                    raise ValueError("Originale completato assente o diverso: " + entry["relative"])
+                path = (source / entry["relative"]).resolve()
+                if not path.is_relative_to(source) or path.is_symlink() or path.is_junction():
+                    raise ValueError("Percorso originale non sicuro: " + entry["relative"])
+                send_progress(callback, progress, "verifica SHA-256 nuova sorgente", path.name)
+                digest = hashlib.sha256()
+                last_progress = time.monotonic()
+                with source_stream(path, allow_cloud) as stream:
+                    before = os.fstat(stream.fileno())
+                    while chunk := stream.read(CHUNK):
+                        if pause.exists():
+                            raise Paused()
+                        digest.update(chunk)
+                        progress["bytes_done"] += len(chunk)
+                        if time.monotonic() - last_progress >= 0.25:
+                            send_progress(callback, progress, "verifica SHA-256 nuova sorgente", path.name)
+                            last_progress = time.monotonic()
+                    after = os.fstat(stream.fileno())
+                if ((before.st_size, before.st_mtime_ns) != (item["size"], item["mtime"])
+                        or (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns)
+                        or digest.hexdigest() != asset["sha256"]):
+                    raise ValueError("Originale non byte-identico o cambiato durante la lettura: " + entry["relative"])
+                if asset["asset_key"] not in checked_assets:
+                    output = owned_output(destination, asset["output"])
+                    sidecar = owned_sidecar(destination, output)
+                    if not output.is_file() or file_hash(output) != asset["sha256"]:
+                        raise ValueError("Output assente o alterato: " + str(output))
+                    raw = sidecar.read_bytes() if sidecar.exists() else None
+                    actual_hash = hashlib.sha256(raw).hexdigest() if raw is not None else None
+                    try:
+                        sidecar_data = json.loads(raw.decode("utf-8-sig")) if raw is not None else None
+                        damaged = raw is None
+                    except (ValueError, UnicodeError):
+                        damaged = True
+                    if damaged:
+                        recovery_candidates.append({"asset_key": asset["asset_key"],
+                                                    "sidecar": str(sidecar.relative_to(destination)),
+                                                    "damaged_hash": actual_hash, "sha256": asset["sha256"]})
+                    else:
+                        expected = sidecar_payload(connection, asset, destination)
+                        hash_matches = actual_hash == asset["sidecar_hash"]
+                        # Pending owned writes can be completed after interruption. A valid,
+                        # independently modified JSON is never treated as crash corruption.
+                        owned_pending = asset["sidecar_pending"] and (hash_matches or sidecar_data == expected)
+                        if not owned_pending and (not hash_matches or sidecar_data != expected):
+                            raise ValueError("Sidecar JSON valido ma modificato: preservato: " + str(sidecar))
+                        accepted_sidecar_hashes[asset["asset_key"]] = actual_hash
+                    checked_assets.add(asset["asset_key"])
+                origin = json.loads(entry["origin"])
+                history = list(origin.get("source_location_history", []))
+                if origin["path"] != str(path):
+                    history.append({"path": origin["path"], "source_root": saved["source"],
+                                    "relocated_at_utc": transferred_at})
+                    origin.update({"path": str(path), "source_location_history": history,
+                                   "relocated_at_utc": transferred_at})
+                origin["mtime_ns"] = item["mtime"]
+                updates.append((item["mtime"], json.dumps(origin, ensure_ascii=False), entry["relative"]))
+                progress["done"] += 1
+                send_progress(callback, progress, "sorgente trasferita verificata", path.name)
+                callback({"event": "log", "action": "relocation_verified", "source": str(path),
+                          "sha256": asset["sha256"], "output": str(destination / asset["output"])})
+            current, omissions = scan_source(source, callback)
+            current_inventory = {item["relative"]: item for item in current}
+            if omissions or any(current_inventory.get(entry["relative"]) != inventory[entry["relative"]] for entry in entries):
+                raise ValueError("Sorgente cambiata durante la verifica: trasferimento annullato")
+            if pause.exists():
+                raise Paused()
+        except Paused:
+            result = {"mode": "relocate-source", "stopped": True, "relocation_complete": False,
+                      "ready_for_review": False, "source": str(source), "destination": str(destination)}
+            callback({"event": "summary", "summary": result, "message": "Verifica sospesa; sorgente salvata invariata"})
+            return result
+        if recovery_candidates:
+            request = SidecarRecoveryRequired(recovery_candidates)
+            if recovery_hash != request.confirmation_hash:
+                raise request
+        # All comparisons succeeded. Back up state, then adopt every occurrence atomically.
+        backup_path = control / ("state-before-relocation-" + str(time.time_ns()) + ".sqlite3")
+        with closing(sqlite3.connect(backup_path)) as backup:
+            connection.backup(backup)
+        for candidate in recovery_candidates:
+            asset = assets[candidate["asset_key"]]
+            output = owned_output(destination, asset["output"])
+            sidecar = owned_sidecar(destination, output)
+            raw = sidecar.read_bytes() if sidecar.exists() else None
+            actual_hash = hashlib.sha256(raw).hexdigest() if raw is not None else None
+            if actual_hash != candidate["damaged_hash"] or file_hash(output) != asset["sha256"]:
+                raise ValueError("Sidecar/output cambiato dopo la conferma: recupero annullato")
+            # Preserve damaged bytes using an exclusive file and flush them before repair.
+            recovery_folder = control / "sidecar-recovery"
+            recovery_folder.mkdir(exist_ok=True)
+            backup_sidecar = recovery_folder / (asset["asset_key"] + "-" + str(time.time_ns()) + ".corrupt")
+            if raw is not None:
+                with backup_sidecar.open("xb") as stream:
+                    stream.write(raw)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            callback({"event": "log", "action": "sidecar_recovery_intent", "sidecar": str(sidecar),
+                      "damaged_hash": actual_hash, "backup": str(backup_sidecar) if raw is not None else None,
+                      "state_backup": str(backup_path), "confirmation_hash": recovery_hash})
+            connection.execute("UPDATE assets SET sidecar_pending=1 WHERE asset_key=?", (asset["asset_key"],))
+            connection.commit()
+            write_sidecar(sidecar, sidecar_payload(connection, asset, destination))
+            connection.execute("UPDATE assets SET sidecar_hash=?,sidecar_pending=0 WHERE asset_key=?",
+                               (file_hash(sidecar), asset["asset_key"]))
+            connection.commit()
+            callback({"event": "log", "action": "sidecar_recovered", "sidecar": str(sidecar),
+                      "sha256": asset["sha256"], "message": "JSON recuperato dal checkpoint: " + str(sidecar)})
+        for key, accepted_hash in accepted_sidecar_hashes.items():
+            sidecar = owned_sidecar(destination, owned_output(destination, assets[key]["output"]))
+            if file_hash(sidecar) != accepted_hash:
+                raise ValueError("Sidecar cambiato durante il recupero: preservato: " + str(sidecar))
+        with connection:
+            # Carry forward durable, authenticated pending JSON bytes before changing origins.
+            for key, accepted_hash in accepted_sidecar_hashes.items():
+                connection.execute("UPDATE assets SET sidecar_hash=? WHERE asset_key=?", (accepted_hash, key))
+            connection.executemany("UPDATE entries SET mtime=?,origin=? WHERE relative=?", updates)
+            for key in checked_assets:
+                connection.execute("UPDATE assets SET sidecar_pending=1 WHERE asset_key=?", (key,))
+            connection.execute("UPDATE settings SET value=? WHERE key='source'", (new_root,))
+        for key in checked_assets:
+            asset = connection.execute("SELECT * FROM assets WHERE asset_key=?", (key,)).fetchone()
+            sidecar = owned_sidecar(destination, owned_output(destination, asset["output"]))
+            # A crash can leave the intended JSON durable before its hash was committed.
+            if (asset["sidecar_pending"] and sidecar.is_file()
+                    and json.loads(sidecar.read_text(encoding="utf-8-sig")) == sidecar_payload(connection, asset, destination)):
+                connection.execute("UPDATE assets SET sidecar_hash=? WHERE asset_key=?", (file_hash(sidecar), key))
+                connection.commit()
+                asset = connection.execute("SELECT * FROM assets WHERE asset_key=?", (key,)).fetchone()
+            if not verify_asset(connection, destination, asset, repair_sidecar=True):
+                raise ValueError("Output mancante; ripeti il trasferimento per completare i sidecar")
+        # Historical summaries are retained, not presented as a new review verdict.
+        ai.write_json(control / "source-relocation.json", {"old_source": saved["source"], "new_source": str(source),
+                      "relocated_at_utc": transferred_at, "verified_occurrences": len(entries), "backup": str(backup_path)})
+        result = {"mode": "relocate-source", "relocation_complete": True, "ready_for_review": False,
+                  "source": str(source), "destination": str(destination), "completed": len(entries),
+                  "total": len(items), "errors": 0, "source_modified_or_deleted": False}
+        callback({"event": "summary", "summary": result, "message": "Sorgente trasferita verificata; copie e AI conservate"})
+        return result
+
+
 # Exceptions: argument/state errors emit a structured message and a nonzero exit code.
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -704,18 +1109,64 @@ def main() -> int:
     modes.add_argument("--run", action="store_true")
     modes.add_argument("--what-if", "--dry-run", action="store_true")
     modes.add_argument("--verify-only", action="store_true")
+    modes.add_argument("--relocate-source", action="store_true")
     parser.add_argument("--allow-cloud", action="store_true")
     parser.add_argument("--no-ai", action="store_true")
+    parser.add_argument("--transcribe", action="store_true", help="Offline audio/video SRT beside output sidecars")
+    parser.add_argument("--describe-videos", action="store_true", help="Sample videos into separate .video.json descriptions")
+    parser.add_argument("--video-min-frames", type=int)
+    parser.add_argument("--video-max-frames", type=int)
+    parser.add_argument("--video-seconds-per-frame", type=float)
+    parser.add_argument("--confirm-sidecar-recovery", help="SHA-256 of the exact recovery request approved by the user")
     parser.add_argument("--reserve-gb", type=float, default=20)
     args = parser.parse_args()
     if args.reserve_gb < 0:
         parser.error("--reserve-gb must be nonnegative")
+    if args.confirm_sidecar_recovery and not args.relocate_source:
+        parser.error("--confirm-sidecar-recovery requires --relocate-source")
+    if args.transcribe and not args.run:
+        parser.error("--transcribe requires --run; verification and simulation do not generate subtitles")
+    if args.describe_videos and not args.run:
+        parser.error("--describe-videos requires --run")
     with JobLog("copy", {"source": str(args.source), "destination": str(args.destination),
-                         "run": args.run, "verify_only": args.verify_only, "use_ai": not args.no_ai}) as log:
+                         "run": args.run, "verify_only": args.verify_only, "relocate_source": args.relocate_source,
+                         "use_ai": not args.no_ai, "describe_videos": args.describe_videos,
+                         "video_min_frames": args.video_min_frames, "video_max_frames": args.video_max_frames,
+                         "video_seconds_per_frame": args.video_seconds_per_frame}) as log:
         log.emit({"event": "log", "message": "Log dettagliato: " + str(log.path), "log_path": str(log.path)})
-        result = run_folder(args.source, args.destination, run=args.run, allow_cloud=args.allow_cloud,
-                            use_ai=not args.no_ai, verify_only=args.verify_only,
-                            reserve_bytes=int(args.reserve_gb * 1024**3), callback=log.emit)
+        if args.relocate_source:
+            try:
+                result = relocate_source(args.source, args.destination, not args.no_ai, args.allow_cloud,
+                                         log.emit, args.confirm_sidecar_recovery)
+            except SidecarRecoveryRequired as request:
+                log.emit({"event": "sidecar_recovery_required", "count": len(request.candidates),
+                          "sidecars": [item["sidecar"] for item in request.candidates],
+                          "confirmation_hash": request.confirmation_hash,
+                          "message": "JSON danneggiati; originali e copie verificati. Recupero disponibile su conferma"})
+                return 4
+            return 0 if result.get("relocation_complete") else 2
+        # Ask the GUI before entering the copying workflow or touching existing state.
+        database = args.destination.resolve() / CONTROL / "state.sqlite3"
+        if args.run and database.is_file():
+            with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as stored:
+                saved_source = stored.execute("SELECT value FROM settings WHERE key='source'").fetchone()
+            if saved_source and saved_source[0] != os.path.normcase(str(args.source.resolve())):
+                log.emit({"event": "source_relocation_required", "old_source": saved_source[0],
+                          "new_source": str(args.source.resolve()),
+                          "message": "Destinazione associata a una sorgente diversa: scegli come procedere"})
+                return 3
+        try:
+            result = run_folder(args.source, args.destination, run=args.run, allow_cloud=args.allow_cloud,
+                                use_ai=not args.no_ai, verify_only=args.verify_only,
+                                reserve_bytes=int(args.reserve_gb * 1024**3), callback=log.emit, transcribe=args.transcribe,
+                                describe_videos=args.describe_videos, video_min_frames=args.video_min_frames,
+                                video_max_frames=args.video_max_frames, video_seconds_per_frame=args.video_seconds_per_frame)
+        except SidecarRecoveryRequired as request:
+            log.emit({"event": "sidecar_recovery_required", "count": len(request.candidates),
+                      "sidecars": [item["sidecar"] for item in request.candidates],
+                      "confirmation_hash": request.confirmation_hash,
+                      "message": "JSON illeggibile: recupero dal checkpoint disponibile su conferma"})
+            return 4
     return 0 if result.get("ready_for_review") or result["mode"] == "what-if" else 2
 
 

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "engine": "faster-whisper",
+  "engine_version": "1.2.1",
+  "pip_version": "26.2.1",
+  "model_repository": "Systran/faster-whisper-small",
+  "model_revision": "536b0662742c02347bc0e980a01041f333bce120",
+  "model_directory": "models/whisper-small",
+  "backend": "cpu",
+  "language": null,
+  "beam_size": 5,
+  "vad_filter": true
+}

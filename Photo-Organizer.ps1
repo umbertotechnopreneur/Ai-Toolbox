@@ -37,6 +37,52 @@ using System.Windows.Forms;
 
 namespace PhotoOrganizer {
     public static class Native {
+        // box: App-owned terminal, never an editable source/destination field.
+        // text: Already logged batch to append to the bounded on-screen buffer.
+        // limit: Maximum visible characters; full text remains in disk logs.
+        // retain: Tail to preserve when trimming old terminal content.
+        // followTail: Scroll only this terminal, without moving its container.
+        public static void AppendLogBatch(RichTextBox box, string text, int limit, int retain, bool followTail) {
+            bool readOnly = box.ReadOnly;
+            int selectionStart = box.SelectionStart;
+            int selectionLength = box.SelectionLength;
+            int removed = 0;
+            if (text.Length > limit) { text = text.Substring(text.Length - limit); }
+            SendLogMessage(box.Handle, 0x000B, IntPtr.Zero, IntPtr.Zero);
+            try {
+                // EM_REPLACESEL on a read-only RichEdit can beep and refuse
+                // truncation. Unlock only during this synchronous UI batch.
+                box.ReadOnly = false;
+                if (box.TextLength + text.Length > limit) {
+                    removed = Math.Min(box.TextLength, Math.Max(box.TextLength - retain,
+                        box.TextLength + text.Length - limit));
+                    box.Select(0, removed);
+                    box.SelectedText = String.Empty;
+                }
+                box.AppendText(text);
+                if (box.Focused) {
+                    int start = Math.Max(0, selectionStart - removed);
+                    box.Select(Math.Min(start, box.TextLength), Math.Min(selectionLength, Math.Max(0, box.TextLength - start)));
+                }
+                if (followTail && !box.Focused) { ScrollLogToBottom(box.Handle); }
+            } finally {
+                box.ReadOnly = readOnly;
+                SendLogMessage(box.Handle, 0x000B, new IntPtr(1), IntPtr.Zero);
+                box.Invalidate();
+            }
+        }
+
+        // window: Existing log control; scroll its text, never the parent viewport.
+        public static void ScrollLogToBottom(IntPtr window) {
+            SendLogMessage(window, 0x0115, new IntPtr(7), IntPtr.Zero);
+        }
+
+        // window: Log window receiving a native scroll message.
+        // message: WM_VSCROLL, confined to the log control.
+        // value: SB_BOTTOM; no keyboard input or caret focus is simulated.
+        // reserved: Always zero.
+        [DllImport("user32.dll", EntryPoint = "SendMessageW")]
+        private static extern IntPtr SendLogMessage(IntPtr window, int message, IntPtr value, IntPtr reserved);
         // path: App-owned font file, loaded privately for this process.
         // flags: FR_PRIVATE for portable, process-local font registration.
         // reserved: Must remain null.
@@ -91,10 +137,13 @@ namespace PhotoOrganizer {
     }
 
     public sealed class DpiForm : Form {
+        // Each window keeps its own minimum dimensions across monitor changes.
+        public Size LogicalMinimumSize { get; set; }
         [StructLayout(LayoutKind.Sequential)]
         private struct WindowRectangle { public int Left, Top, Right, Bottom; }
 
         public DpiForm() {
+            LogicalMinimumSize = new Size(740, 540);
             DoubleBuffered = true;
             AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
@@ -116,11 +165,165 @@ namespace PhotoOrganizer {
                     Scale(new SizeF(factor, factor));
                     AutoScaleDimensions = new SizeF(dpi, dpi);
                 }
-                MinimumSize = new Size((int)(740 * dpi / 96F), (int)(540 * dpi / 96F));
+                MinimumSize = new Size((int)(LogicalMinimumSize.Width * dpi / 96F),
+                    (int)(LogicalMinimumSize.Height * dpi / 96F));
                 Bounds = Rectangle.FromLTRB(suggested.Left, suggested.Top,
                     suggested.Right, suggested.Bottom);
             } finally { ResumeLayout(true); }
             Invalidate(true);
+        }
+    }
+
+    public class ThemeComboBox : ComboBox {
+        public Color SelectionColor { get; set; }
+        public Color DisabledTextColor { get; set; }
+
+        public ThemeComboBox() {
+            DrawMode = DrawMode.OwnerDrawFixed;
+            FlatStyle = FlatStyle.Flat;
+            SelectionColor = Color.FromArgb(23, 46, 73);
+            DisabledTextColor = Color.Gray;
+        }
+
+        // eventArgs: Native list item or closed-selection painting request.
+        protected override void OnDrawItem(DrawItemEventArgs eventArgs) {
+            bool listSelection = (eventArgs.State & DrawItemState.Selected) != 0
+                && (eventArgs.State & DrawItemState.ComboBoxEdit) == 0;
+            Color background = listSelection ? SelectionColor : BackColor;
+            Color foreground = !Enabled ? DisabledTextColor : (listSelection ? Color.White : ForeColor);
+            using (Brush fill = new SolidBrush(background)) { eventArgs.Graphics.FillRectangle(fill, eventArgs.Bounds); }
+            string caption = eventArgs.Index >= 0 && eventArgs.Index < Items.Count
+                ? GetItemText(Items[eventArgs.Index]) : Text;
+            Rectangle bounds = eventArgs.Bounds;
+            bounds.Inflate(-6, 0);
+            TextRenderer.DrawText(eventArgs.Graphics, caption, Font, bounds, foreground,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine
+                | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            if ((eventArgs.State & DrawItemState.Focus) != 0 && listSelection) { eventArgs.DrawFocusRectangle(); }
+        }
+
+        // eventArgs: Font change, including DPI/font preference updates.
+        protected override void OnFontChanged(EventArgs eventArgs) {
+            base.OnFontChanged(eventArgs);
+            ItemHeight = Math.Max(18, Font.Height + 8);
+        }
+
+        // message: Paint the native arrow surface using the same theme as the field.
+        protected override void WndProc(ref Message message) {
+            base.WndProc(ref message);
+            bool printing = message.Msg == 0x0317 || message.Msg == 0x0318;
+            if ((message.Msg != 0x000F && !printing) || !IsHandleCreated || Width < 24) { return; }
+            int buttonWidth = SystemInformation.VerticalScrollBarWidth;
+            Rectangle button = new Rectangle(Width - buttonWidth - 1, 1, buttonWidth, Height - 2);
+            using (Graphics graphics = printing && message.WParam != IntPtr.Zero
+                ? Graphics.FromHdc(message.WParam) : Graphics.FromHwnd(Handle))
+            using (Brush fill = new SolidBrush(BackColor))
+            using (Pen border = new Pen(DisabledTextColor))
+            using (Brush arrow = new SolidBrush(Enabled ? ForeColor : DisabledTextColor)) {
+                graphics.FillRectangle(fill, button);
+                int middleX = button.Left + button.Width / 2;
+                int middleY = button.Top + button.Height / 2;
+                graphics.FillPolygon(arrow, new Point[] { new Point(middleX - 4, middleY - 2),
+                    new Point(middleX + 4, middleY - 2), new Point(middleX, middleY + 2) });
+                graphics.DrawRectangle(border, 0, 0, Width - 1, Height - 1);
+            }
+        }
+    }
+
+    public sealed class PathComboBox : ThemeComboBox {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeRectangle { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ComboInfo {
+            public int Size;
+            public NativeRectangle Item, Button;
+            public int ButtonState;
+            public IntPtr Combo, Edit, List;
+        }
+        // window: This combo's own native handle.
+        // info: Receives the native edit child used by an editable ComboBox.
+        [DllImport("user32.dll")]
+        private static extern bool GetComboBoxInfo(IntPtr window, ref ComboInfo info);
+        // window: The owned edit child.
+        // message: EM_SETREADONLY for locking text without disabled black/gray rendering.
+        // value: Nonzero to prohibit editing.
+        // reserved: Unused message argument.
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr value, IntPtr reserved);
+        private bool locked;
+        public bool IsReadOnly {
+            get { return locked; }
+            set {
+                locked = value;
+                if (locked) { DroppedDown = false; }
+                AutoCompleteMode = locked ? AutoCompleteMode.None : AutoCompleteMode.SuggestAppend;
+                ApplyReadOnly();
+            }
+        }
+        private void ApplyReadOnly() {
+            if (!IsHandleCreated) { return; }
+            ComboInfo info = new ComboInfo();
+            info.Size = Marshal.SizeOf(typeof(ComboInfo));
+            if (GetComboBoxInfo(Handle, ref info) && info.Edit != IntPtr.Zero) {
+                SendMessage(info.Edit, 0x00B1, new IntPtr(locked ? 1 : 0), IntPtr.Zero);
+            }
+        }
+        // e: Reapply the lock if Windows recreates the native combo/edit handles.
+        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); ApplyReadOnly(); }
+        // message: Prevent list navigation while retaining selectable, readable text.
+        protected override void WndProc(ref Message message) {
+            if (locked && (message.Msg == 0x0201 || message.Msg == 0x020A || (message.Msg == 0x014F && message.WParam != IntPtr.Zero) ||
+                (message.Msg == 0x0100 && (message.WParam.ToInt32() == 0x73 || message.WParam.ToInt32() == 0x26 || message.WParam.ToInt32() == 0x28)))) {
+                return;
+            }
+            base.WndProc(ref message);
+        }
+    }
+
+    public sealed class ThemeButton : Button {
+        public Color DisabledTextColor { get; set; }
+        public ThemeButton() {
+            DisabledTextColor = SystemColors.GrayText;
+            DoubleBuffered = true;
+        }
+
+        // e: Paint only the disabled state; native enabled mouse/keyboard behavior stays intact.
+        protected override void OnPaint(PaintEventArgs e) {
+            if (Enabled) { base.OnPaint(e); return; }
+            e.Graphics.Clear(BackColor);
+            if (FlatAppearance.BorderSize > 0) {
+                using (Pen border = new Pen(FlatAppearance.BorderColor, FlatAppearance.BorderSize)) {
+                    e.Graphics.DrawRectangle(border, 0, 0, Math.Max(0, Width - 1), Math.Max(0, Height - 1));
+                }
+            }
+            Rectangle textBounds = Rectangle.Inflate(ClientRectangle, -Padding.Left, -Padding.Top);
+            TextRenderer.DrawText(e.Graphics, Text, Font, textBounds, DisabledTextColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.HidePrefix);
+        }
+    }
+
+    public sealed class ThemeCheckBox : CheckBox {
+        public Color DisabledTextColor { get; set; }
+        public ThemeCheckBox() {
+            DisabledTextColor = SystemColors.GrayText;
+            DoubleBuffered = true;
+        }
+
+        // e: Keep disabled captions readable without making the checkbox interactive.
+        protected override void OnPaint(PaintEventArgs e) {
+            if (Enabled) { base.OnPaint(e); return; }
+            e.Graphics.Clear(BackColor);
+            System.Windows.Forms.VisualStyles.CheckBoxState state = Checked
+                ? System.Windows.Forms.VisualStyles.CheckBoxState.CheckedDisabled
+                : System.Windows.Forms.VisualStyles.CheckBoxState.UncheckedDisabled;
+            Size glyph = CheckBoxRenderer.GetGlyphSize(e.Graphics, state);
+            int gap = Math.Max(4, (int)(6 * e.Graphics.DpiX / 96F));
+            CheckBoxRenderer.DrawCheckBox(e.Graphics, new Point(Padding.Left,
+                Math.Max(Padding.Top, (Height - glyph.Height) / 2)), state);
+            Rectangle textBounds = new Rectangle(Padding.Left + glyph.Width + gap, Padding.Top,
+                Math.Max(0, Width - Padding.Horizontal - glyph.Width - gap), Math.Max(0, Height - Padding.Vertical));
+            TextRenderer.DrawText(e.Graphics, Text, Font, textBounds, DisabledTextColor,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak | TextFormatFlags.HidePrefix);
         }
     }
 
@@ -129,6 +332,94 @@ namespace PhotoOrganizer {
             DoubleBuffered = true;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
         }
+    }
+
+    public sealed class StableScrollPanel : BufferedPanel {
+        public bool SuppressFocusScroll { get; set; }
+
+        // control: Child requesting visibility while background output changes.
+        protected override Point ScrollToControl(Control control) {
+            return SuppressFocusScroll ? DisplayRectangle.Location : base.ScrollToControl(control);
+        }
+
+        // eventArgs: Explicit viewport scroll; repaint translated child surfaces.
+        protected override void OnScroll(ScrollEventArgs eventArgs) {
+            base.OnScroll(eventArgs);
+            if (eventArgs.NewValue != eventArgs.OldValue) { Invalidate(true); }
+        }
+    }
+
+    public sealed class ThemeTabControl : TabControl {
+        public Color CanvasColor { get; set; }
+        public Color SurfaceColor { get; set; }
+        public Color BorderColor { get; set; }
+        public Color MutedColor { get; set; }
+        public Color AccentColor { get; set; }
+        public ThemeTabControl() {
+            CanvasColor = SystemColors.Control;
+            SurfaceColor = SystemColors.Window;
+            BorderColor = SystemColors.ControlDark;
+            MutedColor = SystemColors.GrayText;
+            AccentColor = Color.Teal;
+            Alignment = TabAlignment.Top;
+            SizeMode = TabSizeMode.Fixed;
+            Padding = new Point(12, 7);
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        // Size all native tab rectangles for the actual monospace drawing font.
+        private void UpdateHeaderSize() {
+            int width = 64;
+            foreach (TabPage page in TabPages) {
+                width = Math.Max(width, TextRenderer.MeasureText(page.Text, Font, Size.Empty,
+                    TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding).Width + Padding.X * 2);
+            }
+            ItemSize = new Size(width, Math.Max(28, Font.Height + Padding.Y * 2 + 6));
+        }
+
+        // eventArgs: Updated font, including portable font preference changes.
+        protected override void OnFontChanged(EventArgs eventArgs) {
+            base.OnFontChanged(eventArgs); UpdateHeaderSize();
+        }
+
+        // eventArgs: New settings page whose caption may need a wider header.
+        protected override void OnControlAdded(ControlEventArgs eventArgs) {
+            base.OnControlAdded(eventArgs); UpdateHeaderSize();
+        }
+
+        // e: Paint the entire tab chrome, including the native light surround.
+        protected override void OnPaintBackground(PaintEventArgs e) { e.Graphics.Clear(CanvasColor); }
+
+        // e: Custom headers keep native tab selection, keyboard navigation and page layout.
+        protected override void OnPaint(PaintEventArgs e) {
+            Rectangle page = DisplayRectangle;
+            page.Inflate(1, 1);
+            using (SolidBrush surface = new SolidBrush(SurfaceColor)) { e.Graphics.FillRectangle(surface, page); }
+            using (Pen border = new Pen(BorderColor)) { e.Graphics.DrawRectangle(border, page); }
+            for (int index = 0; index < TabCount; index++) {
+                Rectangle bounds = GetTabRect(index);
+                bool selected = index == SelectedIndex;
+                using (SolidBrush fill = new SolidBrush(selected ? SurfaceColor : CanvasColor)) {
+                    e.Graphics.FillRectangle(fill, bounds);
+                }
+                Color textColor = Enabled ? (selected ? ForeColor : MutedColor) : MutedColor;
+                TextRenderer.DrawText(e.Graphics, TabPages[index].Text, Font, bounds, textColor,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                if (selected) {
+                    int height = Math.Max(2, (int)(3 * e.Graphics.DpiY / 96F));
+                    using (SolidBrush accent = new SolidBrush(AccentColor)) {
+                        e.Graphics.FillRectangle(accent, bounds.Left, bounds.Bottom - height, bounds.Width, height);
+                    }
+                    if (Focused && ShowFocusCues) { ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(bounds, -4, -4), textColor, SurfaceColor); }
+                }
+            }
+            base.OnPaint(e);
+        }
+
+        // e: Repaint headers only when selection changes, not on every setup log update.
+        protected override void OnSelectedIndexChanged(EventArgs e) { base.OnSelectedIndexChanged(e); Invalidate(); }
     }
 
     public sealed class BufferedTable : TableLayoutPanel {
@@ -284,6 +575,8 @@ $script:state = @{
     FirstOutputHashes = @{}; WorkflowStarted = $false
     CleanupPlan = $null
     PendingProgress = $null
+    SourceRelocation = $null
+    SidecarRecovery = $null
     LogBuffer = (New-Object Text.StringBuilder)
     LastLogFlush = [datetime]::MinValue
 }
@@ -291,10 +584,12 @@ $script:smokeMode = [bool]($UiSmokeTest -or $DialogSmokeTest)
 $script:dialogSmokeMode = [bool]$DialogSmokeTest
 $script:workflowTestMode = [bool]$WorkflowSmokeTest
 . (Join-Path $script:appRoot 'scripts\Ui-Options.ps1')
+. (Join-Path $script:appRoot 'scripts\Ui-Paths.ps1')
 . (Join-Path $script:appRoot 'scripts\Ui-Cleanup.ps1')
 . (Join-Path $script:appRoot 'scripts\Ui-Branding.ps1')
 . (Join-Path $script:appRoot 'scripts\Ui-Smoke.ps1')
 Initialize-UiPreferences
+Initialize-PathHistory
 Initialize-AppBranding
 $guiLogFolder = Join-Path $script:appRoot 'logs\photo-organizer'
 [void][IO.Directory]::CreateDirectory($guiLogFolder)
@@ -313,7 +608,7 @@ function New-UiLabel {
     $label.UseMnemonic = $false
     $label.BackColor = [Drawing.Color]::Transparent
     $label.ForeColor = $Color
-    $label.Tag = if ($Color -eq $script:palette.Muted) { 'muted' } elseif ($Color -eq $script:palette.Green) { 'green' } elseif ($Color -eq $script:palette.Ink) { 'ink' } else { 'fixed' }
+    $label.Tag = if ($Color -eq $script:palette.Muted) { 'muted' } elseif ($Color -eq $script:palette.Green) { 'green' } elseif ($Color -eq $script:palette.Amber) { 'amber' } elseif ($Color -eq $script:palette.Red) { 'red' } elseif ($Color -eq $script:palette.Ink) { 'ink' } else { 'fixed' }
     $label.Font = New-AppFont $Size $(if ($Bold) { [Drawing.FontStyle]::Bold } else { [Drawing.FontStyle]::Regular })
     $label.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 6)
     return $label
@@ -370,7 +665,7 @@ function New-UiCard {
 # Primary: Use the cyan primary action appearance.
 function New-UiButton {
     param([string]$Text, [switch]$Primary)
-    $button = New-Object Windows.Forms.Button
+    $button = New-Object PhotoOrganizer.ThemeButton
     $button.Text = $Text
     $button.AutoSize = $true
     $button.AutoSizeMode = 'GrowAndShrink'
@@ -412,18 +707,14 @@ function Flush-UiLog {
     if (-not $Force -and ([datetime]::UtcNow - $script:state.LastLogFlush).TotalMilliseconds -lt 250) { return }
     $text = $script:state.LogBuffer.ToString()
     [void]$script:state.LogBuffer.Clear()
-    if ($script:logBox.TextLength -gt 100000) {
-        $script:logBox.Select(0, $script:logBox.TextLength - 75000)
-        $script:logBox.SelectedText = ''
-    }
-    $scrollPosition = $script:workspace.AutoScrollPosition
-    $script:logBox.AppendText($text)
-    $script:logBox.SelectionStart = $script:logBox.TextLength
-    $script:logBox.ScrollToCaret()
-    # Updating a child log must not navigate the outer card stack to its caret.
-    if ($script:workspace.AutoScrollPosition -ne $scrollPosition) {
-        $script:workspace.AutoScrollPosition = New-Object Drawing.Point(-$scrollPosition.X, -$scrollPosition.Y)
-    }
+    $previousSuppression = $script:workspace.SuppressFocusScroll
+    $script:workspace.SuppressFocusScroll = $true
+    try {
+        # Scroll only the inner native text viewport. ScrollToCaret used to
+        # pull the card stack up, then restoring AutoScrollPosition pulled it
+        # down again and left translated/doubled child pixels behind.
+        [PhotoOrganizer.Native]::AppendLogBatch($script:logBox, $text, 100000, 75000, $true)
+    } finally { $script:workspace.SuppressFocusScroll = $previousSuppression }
     $script:state.LastLogFlush = [datetime]::UtcNow
 }
 
@@ -474,6 +765,7 @@ function Test-DirectoryOverlap {
 }
 
 function Update-DefaultDestination {
+    if ($script:state.SettingDestination) { return }
     if ($script:state.DestinationCustomized) { return }
     $source = $script:sourceBox.Text.Trim().Trim('"').TrimEnd([char[]]'\/')
     $name = 'cartella'
@@ -492,14 +784,20 @@ function Update-DefaultDestination {
 # Target: Text box receiving the selected directory.
 # Description: Italian dialog purpose.
 function Select-Directory {
-    param([Windows.Forms.TextBox]$Target, [string]$Description)
+    param([Windows.Forms.Control]$Target, [string]$Description)
     if ($script:smokeMode) { return }
     $dialog = New-Object Windows.Forms.FolderBrowserDialog
     try {
         $dialog.Description = $Description
         $dialog.ShowNewFolderButton = ($Target -eq $script:destinationBox)
         if ([IO.Directory]::Exists($Target.Text)) { $dialog.SelectedPath = $Target.Text }
-        if ($dialog.ShowDialog($script:form) -eq 'OK') { $Target.Text = $dialog.SelectedPath }
+        if ($dialog.ShowDialog($script:form) -eq 'OK') {
+            $Target.Text = $dialog.SelectedPath
+            if ($Target -eq $script:sourceBox -or $Target -eq $script:destinationBox) {
+                try { Remember-PathSelection $script:sourceBox.Text $script:destinationBox.Text }
+                catch { Write-UiLog ('Percorso selezionato; cronologia non salvata: ' + $_.Exception.Message) 'ERRORE' }
+            }
+        }
     } finally { $dialog.Dispose() }
 }
 
@@ -507,9 +805,16 @@ function Select-Directory {
 function Set-UiBusy {
     param([bool]$Busy)
     foreach ($control in @($script:sourceBox, $script:destinationBox, $script:sourceBrowse,
-        $script:destinationBrowse, $script:aiOption,
+        $script:destinationBrowse, $script:aiOption, $script:transcribeOption, $script:videoDescriptionOption,
         $script:simulateButton, $script:copyButton, $script:verifyButton, $script:optionsButton) + $script:cleanupControls) {
-        $control.Enabled = -not $Busy
+        if ($control -is [PhotoOrganizer.PathComboBox]) {
+            $control.IsReadOnly = $Busy
+            $control.Enabled = $true
+        } elseif ($control -is [Windows.Forms.TextBox]) {
+            # Read-only locks the input while keeping native text selectable and legible.
+            $control.ReadOnly = $Busy
+            $control.Enabled = $true
+        } else { $control.Enabled = -not $Busy }
     }
     $script:pauseButton.Enabled = $Busy -and $script:state.Mode -ne 'what-if' -and -not $script:state.PauseRequested
     $script:openButton.Enabled = $true
@@ -518,9 +823,11 @@ function Set-UiBusy {
 }
 
 # Mode: Explicit backend mode, even though what-if is its default.
+# RecoveryHash: user-approved inventory digest for damaged sidecars, never an automatic opt-in.
 # Exception: Invalid inputs, missing runtime/backend, or a launch failure are surfaced.
 function Start-OrganizerWorkflow {
-    param([ValidateSet('what-if', 'run', 'verify-only', 'cleanup-index', 'cleanup-plan', 'cleanup-apply')][string]$Mode = 'what-if')
+    param([ValidateSet('what-if', 'run', 'verify-only', 'relocate-source', 'cleanup-index', 'cleanup-plan', 'cleanup-apply')][string]$Mode = 'what-if',
+          [string]$RecoveryHash = '')
     if ($script:smokeMode) { return }
     if ($null -ne $script:state.Worker) { throw 'Attendi la conclusione del processo corrente.' }
     $cleanup = $Mode.StartsWith('cleanup-')
@@ -533,6 +840,10 @@ function Start-OrganizerWorkflow {
     }
     if (-not [IO.Directory]::Exists($source)) { throw 'La cartella di origine non esiste o non è accessibile.' }
     if ([IO.File]::Exists($destination)) { throw 'La destinazione indica un file, non una cartella.' }
+    if (-not $cleanup) {
+        try { Remember-PathSelection $script:sourceBox.Text $script:destinationBox.Text }
+        catch { Write-UiLog ('Cronologia non salvata; il lavoro puo continuare: ' + $_.Exception.Message) 'ERRORE' }
+    }
     if ($Mode -eq 'verify-only' -and -not [IO.Directory]::Exists($destination)) {
         throw 'La cartella di output non esiste ancora. Esegui prima una copia.'
     }
@@ -548,7 +859,13 @@ function Start-OrganizerWorkflow {
             $arguments += @('--plan-id', $script:state.CleanupPlan.plan_id, '--confirm-plan-hash', $script:state.CleanupPlan.confirmation_hash)
         } else { $script:state.CleanupPlan = $null; $script:cleanupGrid.Rows.Clear() }
     } else { $arguments = @('-B', '-u', $backend, '--source', $source, '--destination', $destination, ('--' + $Mode)) }
-    if ($Mode -eq 'run') { $arguments += '--allow-cloud' }
+    if ($Mode -in @('run', 'relocate-source')) { $arguments += '--allow-cloud' }
+    if ($Mode -eq 'run' -and $script:transcribeOption.Checked) { $arguments += '--transcribe' }
+    if ($Mode -eq 'run' -and $script:videoDescriptionOption.Checked) { $arguments += '--describe-videos' }
+    if ($RecoveryHash) {
+        if ($Mode -ne 'relocate-source') { throw 'Conferma recupero disponibile solo nella verifica sorgente.' }
+        $arguments += @('--confirm-sidecar-recovery', $RecoveryHash)
+    }
     if (-not $cleanup -and -not $script:aiOption.Checked) { $arguments += '--no-ai' }
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.FileName = $python
@@ -577,6 +894,8 @@ function Start-OrganizerWorkflow {
     $script:state.ClosePending = $false
     $script:state.ForceStopped = $false
     $script:state.LastSummary = $null
+    $script:state.SourceRelocation = $null
+    $script:state.SidecarRecovery = $null
     $script:state.HadError = $false
     $script:state.ExitSeen = $false
     $script:state.LastConsoleProgress = [datetime]::MinValue
@@ -589,7 +908,7 @@ function Start-OrganizerWorkflow {
     $script:elapsedLabel.Text = 'Tempo trascorso: --'
     $script:summaryLabel.Text = 'In attesa del riepilogo del backend.'
     $script:fileLabel.Text = 'Avvio del processo...'
-    $caption = switch ($Mode) { 'run' { 'Copia / ripresa' } 'verify-only' { 'Verifica output' } 'cleanup-index' { 'Indice target' } 'cleanup-plan' { 'Simula pulizia' } 'cleanup-apply' { 'Cestino: copie verificate' } default { 'Simulazione' } }
+    $caption = switch ($Mode) { 'run' { 'Copia / ripresa' } 'verify-only' { 'Verifica output' } 'relocate-source' { 'Verifica sorgente trasferita' } 'cleanup-index' { 'Indice target' } 'cleanup-plan' { 'Simula pulizia' } 'cleanup-apply' { 'Cestino: copie verificate' } default { 'Simulazione' } }
     $script:phaseLabel.Text = $caption
     Set-UiStatus ($caption + ' in corso...')
     Set-UiBusy $true
@@ -766,9 +1085,11 @@ function Receive-OrganizerLine {
         'scan' { $script:state.PendingProgress = $payload }
         'progress' { $script:state.PendingProgress = $payload }
         'summary' { Update-OrganizerSummary (Get-EventValue $payload 'summary' $payload) }
+        'source_relocation_required' { $script:state.SourceRelocation = $payload }
+        'sidecar_recovery_required' { $script:state.SidecarRecovery = $payload }
         'error' { $script:state.HadError = $true }
         'log' { }
-        'match' { Add-CleanupMatch $payload }
+        'match' { if ($script:state.Mode.StartsWith('cleanup-')) { Add-CleanupMatch $payload } }
         default { Write-UiLog $Line.Text 'EVENTO'; return }
     }
     $message = [string](Get-EventValue $payload 'message' '')
@@ -783,7 +1104,40 @@ function Complete-OrganizerWorkflow {
     $script:progressBar.Style = 'Continuous'
     $script:pauseButton.Text = '&Pausa'
     Set-UiBusy $false
+    if ($null -ne $script:state.SidecarRecovery -and -not $script:state.ClosePending) {
+        $request = $script:state.SidecarRecovery
+        $script:state.SidecarRecovery = $null
+        Set-UiStatus 'JSON danneggiati: recupero disponibile su conferma.' 'Amber'
+        $examples = (@($request.sidecars) | Select-Object -First 3) -join "`r`n"
+        $question = "Trovati {0} JSON mancanti o illeggibili, compatibili con un'interruzione del PC.`r`n`r`n{1}`r`n`r`nVuoi recuperarli dal checkpoint SQLite?`r`n`r`nIl tool verifica SHA-256 di originali e copie, salva un backup del database e conserva i byte dei JSON corrotti in .photo-organizer\sidecar-recovery prima di rigenerarli. I JSON validi ma modificati non vengono sovrascritti. Poi riprende il lavoro.`r`n`r`nSe i file da recuperare cambiano, verra richiesta una nuova conferma." -f $request.count, $examples
+        $choice = [Windows.Forms.MessageBox]::Show($script:form, $question, 'Recupero JSON dopo interruzione', 'YesNo', 'Warning', 'Button2')
+        if ($choice -eq 'Yes') {
+            try { Start-OrganizerWorkflow 'relocate-source' -RecoveryHash $request.confirmation_hash }
+            catch { Show-UiError $_ }
+        } else { Write-UiLog 'Recupero JSON annullato: nessun sidecar sovrascritto.' }
+        return
+    }
+    if ($null -ne $script:state.SourceRelocation -and -not $script:state.ClosePending) {
+        $request = $script:state.SourceRelocation
+        $script:state.SourceRelocation = $null
+        Set-UiStatus 'La sorgente salvata e diversa: scegli come procedere.' 'Amber'
+        $question = "Questa destinazione era associata a:`r`n{0}`r`n`r`nOra hai selezionato:`r`n{1}`r`n`r`nSi: verifica SHA-256 dei file gia elaborati e delle copie, aggiorna i percorsi e riprendi. Puo richiedere tempo e scaricare i file della cartella selezionata. Nessun originale viene modificato o eliminato.`r`n`r`nNo: scegli un'altra destinazione.`r`nAnnulla: non fare nulla." -f $request.old_source, $request.new_source
+        $choice = [Windows.Forms.MessageBox]::Show($script:form, $question, 'Sorgente trasferita?', 'YesNoCancel', 'Question', 'Button3')
+        try {
+            if ($choice -eq 'Yes') { Start-OrganizerWorkflow 'relocate-source' }
+            elseif ($choice -eq 'No') { $script:destinationBrowse.PerformClick() }
+            else { Write-UiLog 'Trasferimento sorgente annullato: stato e file conservati.' }
+        } catch { Show-UiError $_ }
+        return
+    }
     $summary = $script:state.LastSummary
+    if ($script:state.Mode -eq 'relocate-source' -and $script:state.ExitCode -eq 0 -and
+        -not $script:state.HadError -and (Get-EventValue $summary 'relocation_complete' $false) -and
+        -not $script:state.ClosePending) {
+        Write-UiLog 'Sorgente trasferita verificata. Riprendo le copie dai checkpoint esistenti.'
+        try { Start-OrganizerWorkflow 'run' } catch { Show-UiError $_ }
+        return
+    }
     $stopped = (Get-EventValue $summary 'stopped' $false) -eq $true
     $ready = (Get-EventValue $summary 'ready_for_review' $false) -eq $true
     $summaryErrors = Get-EventValue $summary 'errors' 0
@@ -962,7 +1316,7 @@ function Confirm-OrganizerClose {
 # Box: Text box placed in the adaptive row.
 # Browse: Folder-picker button placed beside the field.
 function New-PathRow {
-    param([string]$Caption, [Windows.Forms.TextBox]$Box, [Windows.Forms.Button]$Browse)
+    param([string]$Caption, [Windows.Forms.Control]$Box, [Windows.Forms.Button]$Browse)
     $table = New-UiTable 2
     $table.ColumnStyles.Clear()
     [void]$table.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
@@ -971,7 +1325,7 @@ function New-PathRow {
     $table.RowCount++
     [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
     $Box.Dock = 'Fill'
-    $Box.BorderStyle = 'FixedSingle'
+    if ($Box -is [Windows.Forms.TextBox]) { $Box.BorderStyle = 'FixedSingle' }
     $Box.Margin = New-Object Windows.Forms.Padding(0, 6, 12, 10)
     $Box.AccessibleName = $Caption
     $Browse.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 8)
@@ -1016,28 +1370,35 @@ $root.RowStyles.Clear()
 [void]$root.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
 $script:form.Controls.Add($root)
 
-$header = New-UiTable 2
+$header = New-UiTable 3
 $header.BackColor = $script:palette.Navy
 $header.Tag = 'header'
 $header.Padding = New-Object Windows.Forms.Padding(28, 20, 28, 16)
 $header.ColumnStyles.Clear()
+[void]$header.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('AutoSize')))
 [void]$header.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
 [void]$header.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('AutoSize')))
 $header.RowCount = 1
 [void]$header.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
 $headerTitles = New-UiTable
-Add-UiRow $headerTitles (New-UiLabel 'UMBERTO GIACOBBI  /  AI TOOLBOX' -Size 9 -Bold -Color $script:palette.Cyan)
+Add-UiRow $headerTitles (New-UiLabel 'VIBEWARE  /  AI TOOLBOX  /  UMBERTO GIACOBBI' -Size 9 -Bold -Color $script:palette.Cyan)
 Add-UiRow $headerTitles (New-UiLabel 'Foto ordinate. Originali al sicuro.' -Size 18 -Bold -Color ([Drawing.Color]::White))
 Add-UiRow $headerTitles (New-UiLabel 'Simula, copia e riprendi. Poi verifica il risultato.' -Size 10 -Color ([Drawing.ColorTranslator]::FromHtml('#BBCCDF')))
-$header.Controls.Add($headerTitles, 0, 0)
+$headerLogo = New-VibeWareLogo -Size 88
+if ($null -ne $headerLogo) {
+    $headerLogo.Anchor = 'Left'
+    $headerLogo.Margin = New-Object Windows.Forms.Padding(0, 0, 18, 0)
+    $header.Controls.Add($headerLogo, 0, 0)
+}
+$header.Controls.Add($headerTitles, 1, 0)
 $script:sessionLabel = New-UiLabel 'PRONTO' -Size 9 -Bold -Color $script:palette.Cyan
 $script:sessionLabel.Anchor = 'Top,Right'
 $script:sessionLabel.Dock = 'None'
 $script:sessionLabel.Margin = New-Object Windows.Forms.Padding(20, 7, 0, 0)
-$header.Controls.Add($script:sessionLabel, 1, 0)
+$header.Controls.Add($script:sessionLabel, 2, 0)
 $root.Controls.Add($header, 0, 0)
 
-$script:workspace = New-Object PhotoOrganizer.BufferedPanel
+$script:workspace = New-Object PhotoOrganizer.StableScrollPanel
 $workspace = $script:workspace
 $workspace.Dock = 'Fill'
 $workspace.AutoScroll = $true
@@ -1048,8 +1409,11 @@ $stack = New-UiTable
 $workspace.Controls.Add($stack)
 
 $folders = New-UiCard '01   Cartelle'
-$script:sourceBox = New-Object Windows.Forms.TextBox
-$script:destinationBox = New-Object Windows.Forms.TextBox
+$script:sourceBox = New-PathCombo $script:pathHistory.Sources
+$script:destinationBox = New-PathCombo $script:pathHistory.Destinations
+$script:sourceBox.Text = $script:pathHistory.Source
+$script:destinationBox.Text = $script:pathHistory.Destination
+$script:state.DestinationCustomized = -not [string]::IsNullOrWhiteSpace($script:destinationBox.Text)
 $script:sourceBrowse = New-UiButton '&Sfoglia...'
 $script:destinationBrowse = New-UiButton 'S&foglia...'
 Add-UiRow $folders.Content (New-PathRow 'Cartella di origine' $script:sourceBox $script:sourceBrowse)
@@ -1058,7 +1422,7 @@ Add-UiRow $folders.Content (New-UiLabel 'La destinazione proposta segue il nome 
 Add-UiRow $stack $folders.Panel
 
 $options = New-UiCard '02   Preferenze e tutela degli originali'
-$script:aiOption = New-Object Windows.Forms.CheckBox
+$script:aiOption = New-Object PhotoOrganizer.ThemeCheckBox
 $script:aiOption.Text = 'Usa AI locale per organizzare le foto'
 $script:aiOption.Checked = $true
 $script:aiOption.AutoSize = $true
@@ -1066,6 +1430,18 @@ $script:aiOption.Dock = 'Top'
 $script:aiOption.BackColor = [Drawing.Color]::White
 $script:aiOption.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 8)
 Add-UiRow $options.Content $script:aiOption
+$script:transcribeOption = New-Object PhotoOrganizer.ThemeCheckBox
+$script:transcribeOption.Text = 'Trascrivi audio e video in SRT (locale, CPU; setup su richiesta)'
+$script:transcribeOption.AutoSize = $true; $script:transcribeOption.Dock = 'Top'
+$script:transcribeOption.Checked = $false
+$script:transcribeOption.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 8)
+Add-UiRow $options.Content $script:transcribeOption
+$script:videoDescriptionOption = New-Object PhotoOrganizer.ThemeCheckBox
+$script:videoDescriptionOption.Text = 'Descrivi i video con AI locale (JSON separato; campionamento configurabile)'
+$script:videoDescriptionOption.AutoSize = $true; $script:videoDescriptionOption.Dock = 'Top'
+$script:videoDescriptionOption.Checked = $false
+$script:videoDescriptionOption.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 8)
+Add-UiRow $options.Content $script:videoDescriptionOption
 Add-UiRow $options.Content (New-UiLabel 'OneDrive gestisce i file in background; nessun pin/sync modificato.' -Size 9 -Color $script:palette.Muted)
 Add-UiRow $options.Content (New-UiLabel 'La copia lascia gli originali intatti. Il pannello 04 sposta nel Cestino solo copie verificate, su conferma.' -Size 10 -Bold -Color $script:palette.Green)
 $script:optionsButton = New-UiButton 'Opzioni / Setup'
@@ -1100,20 +1476,43 @@ foreach ($button in @($script:simulateButton, $script:copyButton, $script:pauseB
     $actions.Controls.Add($button)
 }
 Add-UiRow $activity.Content $actions
+$activityTabs = New-Object PhotoOrganizer.ThemeTabControl
+$activityTabs.Dock = 'Top'
+$activityTabs.Height = 330
+$activityTabs.Margin = New-Object Windows.Forms.Padding(0, 8, 0, 0)
+$activityTabs.Multiline = $true
+$activityTabs.AccessibleName = 'Avanzamento e registro eventi'
+$progressTab = New-Object Windows.Forms.TabPage
+$progressTab.Text = 'Avanzamento'
+$progressTab.Tag = 'surface'
+$progressTab.AutoScroll = $true
+$progressTab.Padding = New-Object Windows.Forms.Padding(14)
+$logTab = New-Object Windows.Forms.TabPage
+$logTab.Text = 'Registro eventi'
+$logTab.Tag = 'surface'
+$logTab.Padding = New-Object Windows.Forms.Padding(14)
+[void]$activityTabs.TabPages.Add($progressTab)
+[void]$activityTabs.TabPages.Add($logTab)
+$progressContent = New-UiTable
+$progressTab.Controls.Add($progressContent)
+Add-UiRow $activity.Content $activityTabs
+# Both pages keep their controls alive: switching tabs never resets the job or log.
 $script:phaseLabel = New-UiLabel 'Pronto per la simulazione' -Size 11 -Bold
-Add-UiRow $activity.Content $script:phaseLabel
+$script:phaseLabel.AutoSize = $false; $script:phaseLabel.AutoEllipsis = $true
+$script:phaseLabel.Height = 32
+Add-UiRow $progressContent $script:phaseLabel
 $script:progressBar = New-Object Windows.Forms.ProgressBar
 $script:progressBar.Dock = 'Top'
 $script:progressBar.Height = 10
 $script:progressBar.Maximum = 1000
 $script:progressBar.MarqueeAnimationSpeed = 25
 $script:progressBar.Margin = New-Object Windows.Forms.Padding(0, 3, 0, 9)
-Add-UiRow $activity.Content $script:progressBar
+Add-UiRow $progressContent $script:progressBar
 $script:fileLabel = New-UiLabel 'Nessun processo avviato.' -Size 9 -Color $script:palette.Muted
 $script:fileLabel.AutoSize = $false
 $script:fileLabel.AutoEllipsis = $true
 $script:fileLabel.Height = 24
-Add-UiRow $activity.Content $script:fileLabel
+Add-UiRow $progressContent $script:fileLabel
 $metrics = New-UiTable 4
 $metrics.Dock = 'Top'
 $metrics.RowCount = 1
@@ -1126,26 +1525,28 @@ $metrics.Controls.Add((New-MetricCell 'FILE ELABORATI' $script:countValue), 0, 0
 $metrics.Controls.Add((New-MetricCell 'DATI COPIATI' $script:bytesValue), 1, 0)
 $metrics.Controls.Add((New-MetricCell 'VELOCITÀ' $script:rateValue), 2, 0)
 $metrics.Controls.Add((New-MetricCell 'TEMPO RESIDUO' $script:etaValue), 3, 0)
-Add-UiRow $activity.Content $metrics
+Add-UiRow $progressContent $metrics
 $script:elapsedLabel = New-UiLabel 'Tempo trascorso: --' -Size 9 -Color $script:palette.Muted
-Add-UiRow $activity.Content $script:elapsedLabel
+Add-UiRow $progressContent $script:elapsedLabel
 $script:summaryLabel = New-UiLabel 'Il riepilogo mostrerà completati, duplicati, file da rivedere ed errori.' -Size 9 -Color $script:palette.Muted
-Add-UiRow $activity.Content $script:summaryLabel
-Add-UiRow $activity.Content (New-UiLabel 'Registro attività' -Size 9 -Bold)
-$script:logBox = New-Object Windows.Forms.TextBox
+Add-UiRow $progressContent $script:summaryLabel
+$script:logBox = New-Object Windows.Forms.RichTextBox
 $script:logBox.Multiline = $true
 $script:logBox.ReadOnly = $true
+$script:logBox.MaxLength = [int]::MaxValue
 $script:logBox.TabStop = $false
-$script:logBox.BorderStyle = 'None'
+$script:logBox.BorderStyle = 'FixedSingle'
+$script:logBox.DetectUrls = $false
+$script:logBox.HideSelection = $false
+$script:logBox.WordWrap = $false
 $script:logBox.BackColor = $script:palette.Navy
 $script:logBox.ForeColor = [Drawing.ColorTranslator]::FromHtml('#D8E7F6')
 $script:logBox.Font = New-AppFont 9
 $script:logBox.Tag = 'console'
-$script:logBox.Dock = 'Top'
-$script:logBox.Height = 148
-$script:logBox.ScrollBars = 'Vertical'
+$script:logBox.Dock = 'Fill'
+$script:logBox.ScrollBars = 'Both'
 $script:logBox.AccessibleName = 'Registro attività del backend'
-Add-UiRow $activity.Content $script:logBox
+$logTab.Controls.Add($script:logBox)
 Add-UiRow $stack $activity.Panel
 Add-CleanupPanel $stack
 
@@ -1157,6 +1558,7 @@ $script:statusLabel = New-UiLabel 'Seleziona l''origine, poi avvia una simulazio
 $script:statusLabel.Margin = New-Object Windows.Forms.Padding(0)
 Add-UiRow $footer $script:statusLabel
 Add-UiRow $footer (New-PublisherCredit)
+Add-UiRow $footer (New-UiLabel 'VibeWare = Human intent, AI, and plenty of tokens ;-)' -Size 9 -Color $script:palette.Muted)
 $root.Controls.Add($footer, 0, 2)
 
 $script:toolTip.SetToolTip($script:simulateButton, 'Mostra il piano con --what-if. Non avvia una copia.')
@@ -1171,18 +1573,39 @@ $script:destinationBox.Add_TextChanged({
     }
 })
 $script:sourceBrowse.Add_Click({ try { Select-Directory $script:sourceBox 'Seleziona la cartella di origine' } catch { Show-UiError $_ } })
+$rememberPaths = {
+    if ($null -eq $script:state.Worker) {
+        try { Remember-PathSelection $script:sourceBox.Text $script:destinationBox.Text }
+        catch { Write-UiLog ('Salvataggio percorsi: ' + $_.Exception.Message) 'ERRORE' }
+    }
+}
+$script:sourceBox.Add_Leave($rememberPaths)
+$script:destinationBox.Add_Leave($rememberPaths)
 $script:destinationBrowse.Add_Click({ try { Select-Directory $script:destinationBox 'Seleziona la cartella di destinazione' } catch { Show-UiError $_ } })
 $script:simulateButton.Add_Click({ try { Start-OrganizerWorkflow 'what-if' } catch { Show-UiError $_ } })
 $script:copyButton.Add_Click({ try { Start-OrganizerWorkflow 'run' } catch { Show-UiError $_ } })
 $script:verifyButton.Add_Click({ try { Start-OrganizerWorkflow 'verify-only' } catch { Show-UiError $_ } })
 $script:pauseButton.Add_Click({ try { Request-OrganizerPause } catch { Show-UiError $_ } })
 $script:openButton.Add_Click({ try { Open-OrganizerOutput } catch { Show-UiError $_ } })
-$script:form.Add_FormClosing({ param($sender, $eventArgs) Confirm-OrganizerClose $eventArgs })
+$script:form.Add_FormClosing({
+    param($sender, $eventArgs)
+    Confirm-OrganizerClose $eventArgs
+    if (-not $eventArgs.Cancel) { & $rememberPaths }
+})
 $script:form.Add_HandleCreated({ Set-WindowTheme $script:form })
 Update-DefaultDestination
 Set-UiBusy $false
 
 $script:uiTimer = New-Object Windows.Forms.Timer
+$script:themeTimer = New-Object Windows.Forms.Timer
+$script:themeTimer.Interval = 2000
+$script:themeTimer.Add_Tick({
+    if ($script:uiPreferences.Theme -ne 'System') { return }
+    $currentTheme = Get-AppTheme
+    if ($currentTheme -eq $script:effectiveTheme) { return }
+    # Poll on the UI thread and repaint only when the system theme actually changes.
+    foreach ($window in @([Windows.Forms.Application]::OpenForms)) { Set-AppAppearance $window }
+})
 $script:uiTimer.Interval = 100
 $script:uiTimer.Add_Tick({
     if ($script:state.TimerBusy) { return }
@@ -1192,6 +1615,7 @@ $script:uiTimer.Add_Tick({
         $budget = [Diagnostics.Stopwatch]::StartNew()
         $processed = 0
         $line = $null
+        $script:workspace.SuppressFocusScroll = $true
         while ($processed -lt 200 -and $budget.ElapsedMilliseconds -lt 25 -and
             $script:state.Worker.TryTake([ref]$line)) {
             try { Receive-OrganizerLine $line }
@@ -1206,7 +1630,7 @@ $script:uiTimer.Add_Tick({
         }
         Flush-UiLog
         if ($script:state.ExitSeen -and $script:state.Worker.IsCompleted) { Complete-OrganizerWorkflow }
-    } finally { $script:state.TimerBusy = $false }
+    } finally { $script:workspace.SuppressFocusScroll = $false; $script:state.TimerBusy = $false }
 })
 
 $script:smokeTimer = New-Object Windows.Forms.Timer
@@ -1263,6 +1687,7 @@ $script:form.Add_Shown({
         if (-not $dpiEnabled) { Write-UiLog 'Windows non ha accettato il contesto DPI per monitor.' 'AVVISO' }
     }
     $script:uiTimer.Start()
+    $script:themeTimer.Start()
 })
 $script:form.AutoScaleDimensions = New-Object Drawing.SizeF(96, 96)
 $script:form.ResumeLayout($true)
@@ -1270,6 +1695,8 @@ Set-AppAppearance $script:form
 
 try { [Windows.Forms.Application]::Run($script:form) }
 finally {
+    $script:themeTimer.Stop()
+    $script:themeTimer.Dispose()
     $script:uiTimer.Stop()
     $script:uiTimer.Dispose()
     $script:smokeTimer.Dispose()

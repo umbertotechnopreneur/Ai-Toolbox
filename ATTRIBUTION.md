@@ -18,11 +18,16 @@ Dependency binaries and models are not stored in this source repository. Their o
 
 - [Python](https://www.python.org/) — embedded Windows runtime.
 - [Pillow](https://pillow.readthedocs.io/) — image metadata and previews.
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — optional local speech recognition, MIT; uses CTranslate2, PyAV and other independently licensed dependencies.
+- [Whisper small converted by SYSTRAN](https://huggingface.co/Systran/faster-whisper-small) — optional multilingual speech model, pinned revision in `config/transcription.json`. Preserve upstream notices and dependency licenses when redistributing its runtime.
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) — local inference engine.
 - [Qwen3-VL-4B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF) — vision/language model and projector.
 - [FFmpeg](https://ffmpeg.org/) and the [Gyan Windows builds](https://www.gyan.dev/ffmpeg/builds/) — ffprobe metadata extraction; inspect the downloaded build's license/configuration before redistribution.
 - [Nerd Fonts](https://github.com/ryanoasis/nerd-fonts) / [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) — optional private monospace fonts. Setup retains their downloaded license notices.
 
 Exact package URLs, versions and integrity values are recorded in `config/downloads.lock.json` and `config/fonts.lock.json`.
+Optional ASR uses `config/transcription.json`; its setup retains pip's dependency
+URL/hash report and a local model/package integrity manifest. The original source
+MIT license does not replace third-party package, codec or model licenses.
 
 Planned manifesto URL: https://umbertogiacobbi.biz/vibeware. Its publication is not confirmed by this repository.
